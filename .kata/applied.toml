@@ -1,0 +1,33 @@
+preset = "github.com/yukimemi/pj-presets:rust-lib"
+applied_at = "2026-05-05T15:21:56.0115235Z"
+
+[[templates]]
+source = "github.com/yukimemi/pj-base"
+rev = "c8c22d87d21225ce16543f7c9d0d417f4cf36b8d"
+version = "0.2.0"
+
+[[templates]]
+source = "github.com/yukimemi/pj-rust"
+rev = "3deb51c5fb667544a10c2bbcefc180290eb8db54"
+version = "0.2.0"
+
+[[templates]]
+source = "github.com/yukimemi/pj-rust-lib"
+rev = "0733ad156782c513657a6d4dd5a1123957e4982d"
+version = "0.1.0"
+
+[files.".github/workflows/release.yml"]
+content_hash = "6c51d0d36d8c6a5299da254dee010ee87ba0ffe46864c9dba31c3480fcca3a56"
+once_applied = true
+
+[files."AGENTS.md"]
+content_hash = "52d14572656825598d4c52bfe881064c0cd86bc3bf842c68b3836afc60f27718"
+
+[files."Makefile.toml"]
+content_hash = "a472b7d29835466dfa5d9fe7dbceb69dd39736a5b05b1fbe5b2cd7726a63a025"
+
+[files."renovate.json"]
+content_hash = "2ad03ca1cca4789f4f4be3ff727b2aff2fe252bbf7a49e32f20d20d3731ca3f5"
+
+[files."renri.toml"]
+content_hash = "f4751570494ba62997cfb47e3abee2e707d3e01d924d1e8b940905a4e7c974f3"

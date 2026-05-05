@@ -31,8 +31,9 @@
       "automerge": true
     },
     {
-      "description": "Group all GitHub Actions updates into one PR",
-      "matchManagers": ["github-actions"],
+      "description": "Group all GitHub Actions updates into one PR (covers both the built-in github-actions manager and the regex customManager that scans .template files). matchDatasources scopes this to github-tags so future customManagers for non-actions deps don't accidentally land in the github-actions group.",
+      "matchManagers": ["github-actions", "regex"],
+      "matchDatasources": ["github-tags"],
       "groupName": "github-actions"
     },
     {
