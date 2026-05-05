@@ -4,7 +4,7 @@
 //! 1. Fetch the latest release information from GitHub.
 //! 2. Detect how the current executable was installed (e.g., via `cargo install`).
 //! 3. Perform a self-update by replacing the current binary.
-//! 4. Manage background update check intervals to avoid frequent API calls.
+//! 4. Manage background update check intervals to avoid frequent API calls via [`Checker`].
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -22,15 +22,13 @@ pub struct LatestRelease {
 }
 
 /// The method by which the current executable was installed.
-///
-/// This is used to determine how to perform the update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMethod {
-    /// Installed via `cargo install`. Update is performed by running `cargo install` again.
+    /// Installed via `cargo install`.
     CargoInstall,
-    /// A development build found under a `target/` directory. Updates are usually refused.
+    /// A development build found under a `target/` directory.
     DevBuild,
-    /// A standalone binary. Update is performed by downloading and replacing the binary.
+    /// A standalone binary.
     DirectBinary,
 }
 
@@ -41,6 +39,8 @@ pub struct UpdateCheckState {
     pub last_checked_unix: u64,
     /// The tag name of the latest version found in the last check.
     pub last_known_latest: Option<String>,
+    /// The URL of the latest version found in the last check.
+    pub last_known_url: Option<String>,
 }
 
 /// Configuration options for `kaishin`.
@@ -58,12 +58,6 @@ pub struct KaishinOptions {
 
 impl KaishinOptions {
     /// Creates a new instance of `KaishinOptions`.
-    ///
-    /// # Example
-    /// ```
-    /// use kaishin::KaishinOptions;
-    /// let opts = KaishinOptions::new("yukimemi", "kaishin", "kaishin", "0.1.0");
-    /// ```
     pub fn new(owner: &str, repo: &str, bin_name: &str, current_version: &str) -> Self {
         Self {
             owner: owner.to_string(),
@@ -74,21 +68,93 @@ impl KaishinOptions {
     }
 }
 
+/// A high-level handler for managing background update checks.
+///
+/// It encapsulates JSON state persistence and update logic.
+#[derive(Debug, Clone)]
+pub struct Checker {
+    app_name: String,
+    opts: KaishinOptions,
+    interval: Duration,
+}
+
+impl Checker {
+    /// Creates a new `Checker` for the given application.
+    pub fn new(app_name: &str, opts: KaishinOptions) -> Self {
+        Self {
+            app_name: app_name.to_string(),
+            opts,
+            interval: Duration::from_secs(86400),
+        }
+    }
+
+    /// Sets the interval between background update checks.
+    pub fn interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    /// Determines if a background check should be performed now.
+    pub fn should_check(&self) -> bool {
+        let state = self.load_state();
+        should_auto_check(state.as_ref(), self.interval, SystemTime::now())
+    }
+
+    /// Fetches the latest release, saves it to the state file, and returns the result.
+    pub async fn check_and_save(&self) -> Result<LatestRelease> {
+        let latest = check_latest_release(&self.opts).await?;
+        let now_unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let state = UpdateCheckState {
+            last_checked_unix: now_unix,
+            last_known_latest: Some(latest.tag_name.clone()),
+            last_known_url: Some(latest.html_url.clone()),
+        };
+        let _ = self.save_state(&state);
+        Ok(latest)
+    }
+
+    /// Returns the cached latest release from the state file, if available and newer.
+    pub fn cached_update(&self) -> Option<LatestRelease> {
+        let state = self.load_state()?;
+        let latest_tag = state.last_known_latest?;
+        if is_update_available(&self.opts.current_version, &latest_tag).unwrap_or(false) {
+            Some(LatestRelease {
+                tag_name: latest_tag,
+                html_url: state.last_known_url.unwrap_or_default(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Formats an update banner for the given release.
+    pub fn format_banner(&self, latest: &LatestRelease) -> String {
+        format_update_banner(&self.opts, latest)
+    }
+
+    fn load_state(&self) -> Option<UpdateCheckState> {
+        load_check_state(&self.app_name)
+    }
+
+    fn save_state(&self, state: &UpdateCheckState) -> Result<()> {
+        save_check_state(&self.app_name, state)
+    }
+}
+
 /// Returns the default interval between background update checks (24 hours).
 pub fn default_interval() -> Duration {
     Duration::from_secs(86400)
 }
 
 /// Parses a duration string (e.g., "24h", "1d", "30m") into a `Duration`.
-///
-/// Uses the `humantime` crate for parsing.
 pub fn parse_interval(s: &str) -> Result<Duration> {
     Ok(humantime::parse_duration(s)?)
 }
 
 /// Detects the installation method of the executable at the given path.
-///
-/// It checks if the path is under a `target/` directory or within a Cargo binary directory.
 pub fn detect_install_method(exe: &Path) -> InstallMethod {
     let s = exe.to_string_lossy().replace('\\', "/").to_lowercase();
     if s.contains("/target/debug/") || s.contains("/target/release/") {
@@ -116,9 +182,6 @@ pub fn detect_install_method(exe: &Path) -> InstallMethod {
 }
 
 /// Compares the current version with a latest tag and returns `true` if an update is available.
-///
-/// # Errors
-/// Returns an error if either version string cannot be parsed as a valid semver.
 pub fn is_update_available(current: &str, latest_tag: &str) -> Result<bool> {
     let cur = semver::Version::parse(current)
         .map_err(|e| anyhow!("invalid current version `{}`: {}", current, e))?;
@@ -129,8 +192,6 @@ pub fn is_update_available(current: &str, latest_tag: &str) -> Result<bool> {
 }
 
 /// Fetches the latest release information for the repository specified in `opts` from GitHub.
-///
-/// This is an asynchronous function that uses `reqwest`.
 pub async fn check_latest_release(opts: &KaishinOptions) -> Result<LatestRelease> {
     let url = format!(
         "https://api.github.com/repos/{}/{}/releases/latest",
@@ -160,8 +221,6 @@ pub fn load_check_state(app_name: &str) -> Option<UpdateCheckState> {
 }
 
 /// Saves the persistent update check state for the given application name.
-///
-/// The save is performed atomically using a temporary file.
 pub fn save_check_state(app_name: &str, state: &UpdateCheckState) -> Result<()> {
     if let Some(p) = state_path(app_name) {
         if let Some(parent) = p.parent() {
@@ -206,12 +265,6 @@ pub fn format_update_banner(opts: &KaishinOptions, latest: &LatestRelease) -> St
 }
 
 /// Executes the self-update flow.
-///
-/// 1. Fetches the latest release from GitHub.
-/// 2. Compares versions.
-/// 3. If `check_only` is true, prints status and returns.
-/// 4. Prompts the user (if `yes` is false and terminal is interactive).
-/// 5. Detects the installation method and performs the update accordingly.
 pub async fn run_self_update(opts: &KaishinOptions, yes: bool, check_only: bool) -> Result<()> {
     let latest = check_latest_release(opts)
         .await
@@ -360,6 +413,7 @@ mod tests {
         let state = UpdateCheckState {
             last_checked_unix: now_unix - 3600,
             last_known_latest: None,
+            last_known_url: None,
         };
         assert!(!should_auto_check(Some(&state), Duration::from_secs(86400), now));
 
@@ -367,6 +421,7 @@ mod tests {
         let state = UpdateCheckState {
             last_checked_unix: now_unix - 100000,
             last_known_latest: None,
+            last_known_url: None,
         };
         assert!(should_auto_check(Some(&state), Duration::from_secs(86400), now));
     }
