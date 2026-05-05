@@ -6,6 +6,16 @@ authors = ["yukimemi"]
 license = "MIT"
 description = "Universal self-update library for Rust CLIs, extracted from rvpm and renri."
 repository = "https://github.com/yukimemi/kaishin"
+homepage = "https://github.com/yukimemi/kaishin"
+readme = "README.md"
+keywords = ["self-update", "cli", "github", "updater"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
 
 [dependencies]
 anyhow = "1.0"
