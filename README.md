@@ -1,5 +1,12 @@
 # kaishin
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="kaishin logo" src="assets/logo.svg" width="500">
+  </picture>
+</p>
+
 Universal self-update library for Rust CLIs, extracted from rvpm and renri.
 
 ## Features

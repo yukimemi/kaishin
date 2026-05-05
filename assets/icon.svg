@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="kaishin icon">
+  <!-- kaishin (改新) — universal self-update icon -->
+  <g fill="none" stroke-width="24" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Outer stability (Deep Blue) -->
+    <circle cx="96" cy="128" r="64" stroke="#225378" />
+    <!-- Forward/Update arrow (Teal) -->
+    <path d="M160 64 L 160 192 L 224 128 Z" stroke="#66c2a5" />
+    <!-- Core change/point (Orange) -->
+    <rect x="120" y="120" width="16" height="16"
+          transform="rotate(45 128 128)"
+          fill="#fc8d62" />
+  </g>
+</svg>
