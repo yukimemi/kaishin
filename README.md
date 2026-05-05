@@ -1,9 +1,9 @@
 # kaishin
 
-<p align="center">
+<p align center>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img alt="kaishin logo" src="assets/logo.svg" width="500">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/kaishin/main/assets/logo-dark.svg">
+    <img alt="kaishin logo" src="https://raw.githubusercontent.com/yukimemi/kaishin/main/assets/logo.svg" width="500">
   </picture>
 </p>
 
