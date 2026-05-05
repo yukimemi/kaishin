@@ -1,0 +1,331 @@
+//! Universal self-update library for Rust CLIs, extracted from rvpm and renri.
+//!
+//! Provides features:
+//! 1. `run_self_update` — Fetch latest release from GitHub, compare versions, and update.
+//! 2. Background update check banner — Fetch latest in background and show a banner.
+
+use anyhow::{Result, anyhow, Context};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+/// GitHub releases API response.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LatestRelease {
+    /// Tag name (e.g., `v3.31.4`).
+    pub tag_name: String,
+    /// Release page URL.
+    #[serde(default)]
+    pub html_url: String,
+}
+
+/// Installation method detected from current executable path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMethod {
+    /// Installed via `cargo install`.
+    CargoInstall,
+    /// Development build (under `target/`).
+    DevBuild,
+    /// Standalone binary.
+    DirectBinary,
+}
+
+/// Persistent state for background update checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateCheckState {
+    /// Last checked Unix timestamp.
+    pub last_checked_unix: u64,
+    /// Last known latest tag.
+    pub last_known_latest: Option<String>,
+}
+
+/// Options for `kaishin`.
+#[derive(Debug, Clone)]
+pub struct KaishinOptions {
+    pub owner: String,
+    pub repo: String,
+    pub bin_name: String,
+    pub current_version: String,
+}
+
+impl KaishinOptions {
+    pub fn new(owner: &str, repo: &str, bin_name: &str, current_version: &str) -> Self {
+        Self {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            bin_name: bin_name.to_string(),
+            current_version: current_version.to_string(),
+        }
+    }
+}
+
+pub fn default_interval() -> Duration {
+    Duration::from_secs(86400)
+}
+
+pub fn parse_interval(s: &str) -> Result<Duration> {
+    Ok(humantime::parse_duration(s)?)
+}
+
+pub fn detect_install_method(exe: &Path) -> InstallMethod {
+    let s = exe.to_string_lossy().replace('\\', "/").to_lowercase();
+    if s.contains("/target/debug/") || s.contains("/target/release/") {
+        return InstallMethod::DevBuild;
+    }
+    let cargo_bin = std::env::var("CARGO_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
+        .map(|p| {
+            p.join("bin")
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_lowercase()
+        });
+    if let Some(bin) = cargo_bin {
+        if s.starts_with(&format!("{}/", bin)) {
+            return InstallMethod::CargoInstall;
+        }
+    }
+    if s.contains("/.cargo/bin/") || s.contains("/cargo/bin/") {
+        return InstallMethod::CargoInstall;
+    }
+    InstallMethod::DirectBinary
+}
+
+pub fn is_update_available(current: &str, latest_tag: &str) -> Result<bool> {
+    let cur = semver::Version::parse(current)
+        .map_err(|e| anyhow!("invalid current version `{}`: {}", current, e))?;
+    let lat_str = latest_tag.trim_start_matches('v');
+    let lat = semver::Version::parse(lat_str)
+        .map_err(|e| anyhow!("invalid latest tag `{}`: {}", latest_tag, e))?;
+    Ok(lat > cur)
+}
+
+pub async fn check_latest_release(opts: &KaishinOptions) -> Result<LatestRelease> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/releases/latest",
+        opts.owner, opts.repo
+    );
+    let client = reqwest::Client::builder()
+        .user_agent(format!("{}/{}", opts.bin_name, opts.current_version))
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let res = client.get(url).send().await?;
+    if !res.status().is_success() {
+        return Err(anyhow!("GitHub releases API returned {}", res.status()));
+    }
+    let release: LatestRelease = res.json().await?;
+    Ok(release)
+}
+
+fn state_path(app_name: &str) -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(app_name).join("last_update_check.json"))
+}
+
+pub fn load_check_state(app_name: &str) -> Option<UpdateCheckState> {
+    let p = state_path(app_name)?;
+    let content = std::fs::read_to_string(p).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+pub fn save_check_state(app_name: &str, state: &UpdateCheckState) -> Result<()> {
+    if let Some(p) = state_path(app_name) {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+            let json = serde_json::to_string(state)?;
+            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+            use std::io::Write;
+            tmp.write_all(json.as_bytes())?;
+            tmp.persist(&p)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn should_auto_check(
+    state: Option<&UpdateCheckState>,
+    interval: Duration,
+    now: SystemTime,
+) -> bool {
+    let Some(state) = state else {
+        return true;
+    };
+    let Ok(now_unix) = now.duration_since(SystemTime::UNIX_EPOCH) else {
+        return true;
+    };
+    let elapsed = now_unix.as_secs().saturating_sub(state.last_checked_unix);
+    elapsed >= interval.as_secs()
+}
+
+pub fn format_update_banner(opts: &KaishinOptions, latest: &LatestRelease) -> String {
+    let tag = latest.tag_name.trim_start_matches('v');
+    let mut s = format!(
+        "\u{2699} {} {} available (current {}) — run `{} self-update` to upgrade",
+        opts.bin_name, tag, opts.current_version, opts.bin_name
+    );
+    if !latest.html_url.is_empty() {
+        s.push_str(&format!("\n  release notes: {}", latest.html_url));
+    }
+    s
+}
+
+pub async fn run_self_update(opts: &KaishinOptions, yes: bool, check_only: bool) -> Result<()> {
+    let latest = check_latest_release(opts)
+        .await
+        .context("failed to fetch latest release from GitHub")?;
+
+    let available = is_update_available(&opts.current_version, &latest.tag_name)?;
+    if !available {
+        println!("\u{2713} {} {} is already up to date.", opts.bin_name, opts.current_version);
+        return Ok(());
+    }
+
+    let latest_clean = latest.tag_name.trim_start_matches('v');
+    if check_only {
+        println!(
+            "\u{2699} {} {} available (current {}). Run `{} self-update` to install.",
+            opts.bin_name, latest_clean, opts.current_version, opts.bin_name
+        );
+        if !latest.html_url.is_empty() {
+            println!("  release notes: {}", latest.html_url);
+        }
+        return Ok(());
+    }
+
+    if !yes {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "non-interactive mode: use `--yes` to proceed with update to v{}",
+                latest_clean
+            );
+        }
+
+        eprint!("Update to v{}? [y/N] ", latest_clean);
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            eprintln!("aborted.");
+            return Ok(());
+        }
+    }
+
+    let exe = std::env::current_exe().context("failed to resolve current_exe()")?;
+    let method = detect_install_method(&exe);
+    match method {
+        InstallMethod::DevBuild => {
+            return Err(anyhow!(
+                "\u{26a0} `{}` looks like a development build. Refusing to self-update.",
+                exe.display()
+            ));
+        }
+        InstallMethod::CargoInstall => {
+            let tmp = tempfile::Builder::new()
+                .prefix(&format!("{}-self-update-", opts.bin_name))
+                .tempdir()?;
+            let tmp_root = tmp.path().to_path_buf();
+            println!(
+                "running: cargo install {} --version {} --locked --force --root {}",
+                opts.bin_name,
+                latest_clean,
+                tmp_root.display()
+            );
+            let status = std::process::Command::new("cargo")
+                .arg("install")
+                .arg(&opts.bin_name)
+                .arg("--version")
+                .arg(latest_clean)
+                .arg("--locked")
+                .arg("--force")
+                .arg("--root")
+                .arg(&tmp_root)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("cargo install failed");
+            }
+            let bin_exe_name = if cfg!(windows) {
+                format!("{}.exe", opts.bin_name)
+            } else {
+                opts.bin_name.clone()
+            };
+            let new_exe = tmp_root.join("bin").join(bin_exe_name);
+            self_update::self_replace::self_replace(&new_exe)?;
+            println!("\u{2713} {} v{} installed.", opts.bin_name, latest_clean);
+        }
+        InstallMethod::DirectBinary => {
+            let status = self_update::backends::github::Update::configure()
+                .repo_owner(&opts.owner)
+                .repo_name(&opts.repo)
+                .bin_name(&opts.bin_name)
+                .show_download_progress(true)
+                .current_version(&opts.current_version)
+                .target_version_tag(&latest.tag_name)
+                .build()
+                .map_err(|e| anyhow!("build: {}", e))?
+                .update()
+                .map_err(|e| anyhow!("update: {}", e))?;
+            match status {
+                self_update::Status::UpToDate(v) => {
+                    println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
+                }
+                self_update::Status::Updated(v) => {
+                    println!("\u{2713} {} v{} installed.", opts.bin_name, v)
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_install_method() {
+        let p = PathBuf::from("/home/u/.cargo/bin/kaishin");
+        assert_eq!(detect_install_method(&p), InstallMethod::CargoInstall);
+
+        let p = PathBuf::from(
+            r"C:\Users\yukimemi\src\github.com\yukimemi\kaishin\target\debug\kaishin.exe",
+        );
+        assert_eq!(detect_install_method(&p), InstallMethod::DevBuild);
+
+        let p = PathBuf::from("/opt/kaishin-bin/kaishin");
+        assert_eq!(detect_install_method(&p), InstallMethod::DirectBinary);
+    }
+
+    #[test]
+    fn test_is_update_available() {
+        assert!(is_update_available("0.1.0", "v0.1.1").unwrap());
+        assert!(!is_update_available("0.1.1", "v0.1.1").unwrap());
+        assert!(!is_update_available("0.1.2", "v0.1.1").unwrap());
+    }
+
+    #[test]
+    fn test_should_auto_check() {
+        let now = SystemTime::now();
+        let now_unix = now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+        // No state
+        assert!(should_auto_check(None, Duration::from_secs(86400), now));
+
+        // Recent state
+        let state = UpdateCheckState {
+            last_checked_unix: now_unix - 3600,
+            last_known_latest: None,
+        };
+        assert!(!should_auto_check(Some(&state), Duration::from_secs(86400), now));
+
+        // Old state
+        let state = UpdateCheckState {
+            last_checked_unix: now_unix - 100000,
+            last_known_latest: None,
+        };
+        assert!(should_auto_check(Some(&state), Duration::from_secs(86400), now));
+    }
+}
