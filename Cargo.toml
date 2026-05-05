@@ -38,8 +38,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
 ] }
 dirs = "6.0"
-tempfile = "3"
+tempfile = "3.27.0"
 console = "0.16"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
