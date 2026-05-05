@@ -23,7 +23,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kaishin = { git = "https://github.com/yukimemi/kaishin" }
+kaishin = "0.1"
 ```
 
 ### Self-Update Command
