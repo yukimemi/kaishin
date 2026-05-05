@@ -39,7 +39,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 dirs = "6.0"
 tempfile = "3"
-console = "0.16"
+console = "0.16.3"
 
 [dev-dependencies]
 tempfile = "3"
