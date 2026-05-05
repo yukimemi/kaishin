@@ -73,24 +73,34 @@ impl KaishinOptions {
 /// It encapsulates JSON state persistence and update logic.
 #[derive(Debug, Clone)]
 pub struct Checker {
-    app_name: String,
     opts: KaishinOptions,
     interval: Duration,
+    state_path: PathBuf,
 }
 
 impl Checker {
     /// Creates a new `Checker` for the given application.
+    ///
+    /// By default, the state is stored in the system's data directory under `app_name`.
     pub fn new(app_name: &str, opts: KaishinOptions) -> Self {
+        let state_path = default_state_path(app_name)
+            .expect("failed to resolve default state path (dirs::data_dir() failed)");
         Self {
-            app_name: app_name.to_string(),
             opts,
             interval: Duration::from_secs(86400),
+            state_path,
         }
     }
 
     /// Sets the interval between background update checks.
     pub fn interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
+        self
+    }
+
+    /// Sets a custom path for the persistent state file.
+    pub fn state_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.state_path = path.into();
         self
     }
 
@@ -136,11 +146,11 @@ impl Checker {
     }
 
     fn load_state(&self) -> Option<UpdateCheckState> {
-        load_check_state(&self.app_name)
+        load_check_state(&self.state_path)
     }
 
     fn save_state(&self, state: &UpdateCheckState) -> Result<()> {
-        save_check_state(&self.app_name, state)
+        save_check_state(&self.state_path, state)
     }
 }
 
@@ -209,28 +219,26 @@ pub async fn check_latest_release(opts: &KaishinOptions) -> Result<LatestRelease
     Ok(release)
 }
 
-fn state_path(app_name: &str) -> Option<PathBuf> {
+/// Returns the default path for the state file under the system's data directory.
+pub fn default_state_path(app_name: &str) -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(app_name).join("last_update_check.json"))
 }
 
-/// Loads the persistent update check state for the given application name.
-pub fn load_check_state(app_name: &str) -> Option<UpdateCheckState> {
-    let p = state_path(app_name)?;
-    let content = std::fs::read_to_string(p).ok()?;
+/// Loads the persistent update check state from the given path.
+pub fn load_check_state(path: &Path) -> Option<UpdateCheckState> {
+    let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
-/// Saves the persistent update check state for the given application name.
-pub fn save_check_state(app_name: &str, state: &UpdateCheckState) -> Result<()> {
-    if let Some(p) = state_path(app_name) {
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-            let json = serde_json::to_string(state)?;
-            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-            use std::io::Write;
-            tmp.write_all(json.as_bytes())?;
-            tmp.persist(&p)?;
-        }
+/// Saves the persistent update check state to the given path.
+pub fn save_check_state(path: &Path, state: &UpdateCheckState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let json = serde_json::to_string(state)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        use std::io::Write;
+        tmp.write_all(json.as_bytes())?;
+        tmp.persist(path)?;
     }
     Ok(())
 }
