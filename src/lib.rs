@@ -272,7 +272,10 @@ pub async fn run_self_update(opts: &KaishinOptions, yes: bool, check_only: bool)
 
     let available = is_update_available(&opts.current_version, &latest.tag_name)?;
     if !available {
-        println!("\u{2713} {} {} is already up to date.", opts.bin_name, opts.current_version);
+        println!(
+            "\u{2713} {} {} is already up to date.",
+            opts.bin_name, opts.current_version
+        );
         return Ok(());
     }
 
@@ -404,7 +407,10 @@ mod tests {
     #[test]
     fn test_should_auto_check() {
         let now = SystemTime::now();
-        let now_unix = now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let now_unix = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // No state
         assert!(should_auto_check(None, Duration::from_secs(86400), now));
@@ -415,7 +421,11 @@ mod tests {
             last_known_latest: None,
             last_known_url: None,
         };
-        assert!(!should_auto_check(Some(&state), Duration::from_secs(86400), now));
+        assert!(!should_auto_check(
+            Some(&state),
+            Duration::from_secs(86400),
+            now
+        ));
 
         // Old state
         let state = UpdateCheckState {
@@ -423,6 +433,10 @@ mod tests {
             last_known_latest: None,
             last_known_url: None,
         };
-        assert!(should_auto_check(Some(&state), Duration::from_secs(86400), now));
+        assert!(should_auto_check(
+            Some(&state),
+            Duration::from_secs(86400),
+            now
+        ));
     }
 }
