@@ -1,20 +1,23 @@
 preset = "github.com/yukimemi/pj-presets:rust-lib"
-applied_at = "2026-05-05T15:21:56.0115235Z"
+applied_at = "2026-05-05T16:39:34.8955165Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "c8c22d87d21225ce16543f7c9d0d417f4cf36b8d"
-version = "0.2.0"
+rev = "280ca2337400c0fe4cd2da17dc16185581f3a2dd"
+version = "0.3.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "3deb51c5fb667544a10c2bbcefc180290eb8db54"
+rev = "8c3842eb0e073b506f6bc293423a2d20273accae"
 version = "0.2.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-lib"
 rev = "0733ad156782c513657a6d4dd5a1123957e4982d"
 version = "0.1.0"
+
+[files.".gemini/settings.json"]
+content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e"
 
 [files.".github/workflows/release.yml"]
 content_hash = "6c51d0d36d8c6a5299da254dee010ee87ba0ffe46864c9dba31c3480fcca3a56"
@@ -24,10 +27,16 @@ once_applied = true
 content_hash = "52d14572656825598d4c52bfe881064c0cd86bc3bf842c68b3836afc60f27718"
 
 [files."Makefile.toml"]
-content_hash = "a472b7d29835466dfa5d9fe7dbceb69dd39736a5b05b1fbe5b2cd7726a63a025"
+content_hash = "656e02f02146079b1d966219eb395000462fe9121719621dc2d9696f80b13e25"
+
+[files."OPENCODE.md"]
+content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
+
+[files."opencode.json"]
+content_hash = "2ada1cf4347db9e98fadd67ca72cd9e29042c5bf6ab719d666b5d71f97663e81"
 
 [files."renovate.json"]
-content_hash = "2ad03ca1cca4789f4f4be3ff727b2aff2fe252bbf7a49e32f20d20d3731ca3f5"
+content_hash = "32569a8b8904be51b03feff5955357333e191a4e95d93bc2b38bf067f56a6bbb"
 
 [files."renri.toml"]
 content_hash = "f4751570494ba62997cfb47e3abee2e707d3e01d924d1e8b940905a4e7c974f3"
