@@ -32,7 +32,7 @@ self_update = { version = "0.44", default-features = false, features = [
     "compression-zip-deflate",
 ] }
 semver = "1"
-humantime = "2"
+humantime = "2.3.0"
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
