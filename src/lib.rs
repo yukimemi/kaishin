@@ -24,11 +24,11 @@ pub struct LatestRelease {
 /// The method by which the current executable was installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMethod {
-    /// Installed via `cargo install`.
+    /// Installed via `cargo install`. Update is performed by running `cargo install` again.
     CargoInstall,
-    /// A development build found under a `target/` directory.
+    /// A development build found under a `target/` directory. Updates are usually refused.
     DevBuild,
-    /// A standalone binary.
+    /// A standalone binary. Update is performed by downloading and replacing the binary.
     DirectBinary,
 }
 
@@ -280,10 +280,7 @@ pub async fn run_self_update(opts: &KaishinOptions, yes: bool, check_only: bool)
 
     let available = is_update_available(&opts.current_version, &latest.tag_name)?;
     if !available {
-        println!(
-            "\u{2713} {} {} is already up to date.",
-            opts.bin_name, opts.current_version
-        );
+        println!("\u{2713} {} {} is already up to date.", opts.bin_name, opts.current_version);
         return Ok(());
     }
 
@@ -390,6 +387,7 @@ pub async fn run_self_update(opts: &KaishinOptions, yes: bool, check_only: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_detect_install_method() {
@@ -410,15 +408,14 @@ mod tests {
         assert!(is_update_available("0.1.0", "v0.1.1").unwrap());
         assert!(!is_update_available("0.1.1", "v0.1.1").unwrap());
         assert!(!is_update_available("0.1.2", "v0.1.1").unwrap());
+        // No 'v' prefix
+        assert!(is_update_available("0.1.0", "0.1.1").unwrap());
     }
 
     #[test]
     fn test_should_auto_check() {
         let now = SystemTime::now();
-        let now_unix = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now_unix = now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
         // No state
         assert!(should_auto_check(None, Duration::from_secs(86400), now));
@@ -429,11 +426,7 @@ mod tests {
             last_known_latest: None,
             last_known_url: None,
         };
-        assert!(!should_auto_check(
-            Some(&state),
-            Duration::from_secs(86400),
-            now
-        ));
+        assert!(!should_auto_check(Some(&state), Duration::from_secs(86400), now));
 
         // Old state
         let state = UpdateCheckState {
@@ -441,10 +434,54 @@ mod tests {
             last_known_latest: None,
             last_known_url: None,
         };
-        assert!(should_auto_check(
-            Some(&state),
-            Duration::from_secs(86400),
-            now
-        ));
+        assert!(should_auto_check(Some(&state), Duration::from_secs(86400), now));
+    }
+
+    #[test]
+    fn test_format_update_banner() {
+        let opts = KaishinOptions::new("u", "r", "app", "1.0.0");
+        let release = LatestRelease {
+            tag_name: "v1.1.0".to_string(),
+            html_url: "https://example.com".to_string(),
+        };
+        let banner = format_update_banner(&opts, &release);
+        assert!(banner.contains("app 1.1.0 available"));
+        assert!(banner.contains("(current 1.0.0)"));
+        assert!(banner.contains("run `app self-update`"));
+        assert!(banner.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_checker_state_management() {
+        let tmp = tempdir().unwrap();
+        let state_path = tmp.path().join("state.json");
+        let opts = KaishinOptions::new("u", "r", "app", "1.0.0");
+        let checker = Checker::new("app", opts).state_path(&state_path);
+
+        // Initial state
+        assert!(checker.should_check());
+        assert!(checker.cached_update().is_none());
+
+        // Save state manually for testing
+        let now_unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = UpdateCheckState {
+            last_checked_unix: now_unix,
+            last_known_latest: Some("v1.2.0".to_string()),
+            last_known_url: Some("https://rel".to_string()),
+        };
+        checker.save_state(&state).unwrap();
+
+        // Check again
+        assert!(!checker.should_check()); // within 24h
+        let cached = checker.cached_update().unwrap();
+        assert_eq!(cached.tag_name, "v1.2.0");
+        assert_eq!(cached.html_url, "https://rel");
+
+        // Test banner from checker
+        let banner = checker.format_banner(&cached);
+        assert!(banner.contains("app 1.2.0 available"));
     }
 }
