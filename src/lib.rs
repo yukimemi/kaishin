@@ -26,9 +26,9 @@ pub struct LatestRelease {
 pub enum InstallMethod {
     /// Installed via `cargo install`. Update is performed by running `cargo install` again.
     CargoInstall,
-    /// A development build found under a `target/` directory. Updates are usually refused.
+    /// A development build found under a `target/` directory.
     DevBuild,
-    /// A standalone binary. Update is performed by downloading and replacing the binary.
+    /// A standalone binary.
     DirectBinary,
 }
 
@@ -65,6 +65,42 @@ impl KaishinOptions {
             bin_name: bin_name.to_string(),
             current_version: current_version.to_string(),
         }
+    }
+}
+
+/// Options for the self-update process.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    /// Automatically answer "yes" to all prompts.
+    pub yes: bool,
+    /// Only check for updates and print status, don't perform the update.
+    pub check_only: bool,
+    /// Run in non-interactive mode. Bail if a prompt would be required and `yes` is false.
+    pub non_interactive: bool,
+}
+
+impl UpdateOptions {
+    /// Creates a new instance of `UpdateOptions` with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the `yes` flag.
+    pub fn yes(mut self, yes: bool) -> Self {
+        self.yes = yes;
+        self
+    }
+
+    /// Sets the `check_only` flag.
+    pub fn check_only(mut self, check_only: bool) -> Self {
+        self.check_only = check_only;
+        self
+    }
+
+    /// Sets the `non_interactive` flag.
+    pub fn non_interactive(mut self, non_interactive: bool) -> Self {
+        self.non_interactive = non_interactive;
+        self
     }
 }
 
@@ -273,19 +309,29 @@ pub fn format_update_banner(opts: &KaishinOptions, latest: &LatestRelease) -> St
 }
 
 /// Executes the self-update flow.
-pub async fn run_self_update(opts: &KaishinOptions, yes: bool, check_only: bool) -> Result<()> {
+///
+/// 1. Fetches the latest release from GitHub.
+/// 2. Compares versions.
+/// 3. If [`UpdateOptions::check_only`] is true, prints status and returns.
+/// 4. If [`UpdateOptions::non_interactive`] is true and [`UpdateOptions::yes`] is false, bails if an update is available.
+/// 5. Prompts the user (if [`UpdateOptions::yes`] is false and terminal is interactive).
+/// 6. Detects the installation method and performs the update accordingly.
+pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> Result<()> {
     let latest = check_latest_release(opts)
         .await
         .context("failed to fetch latest release from GitHub")?;
 
     let available = is_update_available(&opts.current_version, &latest.tag_name)?;
     if !available {
-        println!("\u{2713} {} {} is already up to date.", opts.bin_name, opts.current_version);
+        println!(
+            "\u{2713} {} {} is already up to date.",
+            opts.bin_name, opts.current_version
+        );
         return Ok(());
     }
 
     let latest_clean = latest.tag_name.trim_start_matches('v');
-    if check_only {
+    if upd_opts.check_only {
         println!(
             "\u{2699} {} {} available (current {}). Run `{} self-update` to install.",
             opts.bin_name, latest_clean, opts.current_version, opts.bin_name
@@ -296,9 +342,9 @@ pub async fn run_self_update(opts: &KaishinOptions, yes: bool, check_only: bool)
         return Ok(());
     }
 
-    if !yes {
+    if !upd_opts.yes {
         use std::io::IsTerminal;
-        if !std::io::stdin().is_terminal() {
+        if upd_opts.non_interactive || !std::io::stdin().is_terminal() {
             anyhow::bail!(
                 "non-interactive mode: use `--yes` to proceed with update to v{}",
                 latest_clean
@@ -415,7 +461,10 @@ mod tests {
     #[test]
     fn test_should_auto_check() {
         let now = SystemTime::now();
-        let now_unix = now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let now_unix = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // No state
         assert!(should_auto_check(None, Duration::from_secs(86400), now));
@@ -426,7 +475,11 @@ mod tests {
             last_known_latest: None,
             last_known_url: None,
         };
-        assert!(!should_auto_check(Some(&state), Duration::from_secs(86400), now));
+        assert!(!should_auto_check(
+            Some(&state),
+            Duration::from_secs(86400),
+            now
+        ));
 
         // Old state
         let state = UpdateCheckState {
@@ -434,7 +487,11 @@ mod tests {
             last_known_latest: None,
             last_known_url: None,
         };
-        assert!(should_auto_check(Some(&state), Duration::from_secs(86400), now));
+        assert!(should_auto_check(
+            Some(&state),
+            Duration::from_secs(86400),
+            now
+        ));
     }
 
     #[test]

@@ -29,7 +29,7 @@ kaishin = "0.1"
 ### Self-Update Command
 
 ```rust
-use kaishin::{KaishinOptions, run_self_update};
+use kaishin::{KaishinOptions, UpdateOptions, run_self_update};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,9 +39,15 @@ async fn main() -> Result<()> {
         "my-tool",
         env!("CARGO_PKG_VERSION")
     );
+    let upd_opts = UpdateOptions::new()
+        .yes(args.yes)
+        .check_only(args.check)
+        .non_interactive(args.non_interactive);
 
     // Run self-update command
-    run_self_update(&opts, args.yes, args.check).await?;
+    run_self_update(&opts, upd_opts).await?;
+    // Note: In non-interactive mode (non_interactive: true), the updater will exit 
+    // unless --yes (yes: true) is provided.
 
     Ok(())
 }
