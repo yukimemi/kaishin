@@ -411,7 +411,7 @@ pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> 
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         eprintln!(
-                            "GitHub release download failed: {e}. Falling back to `cargo install`."
+                            "GitHub release download failed: {e:#}. Falling back to `cargo install`."
                         );
                     }
                 }
@@ -469,9 +469,9 @@ fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> R
         .current_version(&opts.current_version)
         .target_version_tag(&latest.tag_name)
         .build()
-        .map_err(|e| anyhow!("build: {}", e))?
+        .context("build")?
         .update()
-        .map_err(|e| anyhow!("update: {}", e))?;
+        .context("update")?;
     match status {
         self_update::Status::UpToDate(v) => {
             println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
