@@ -24,7 +24,9 @@ pub struct LatestRelease {
 /// The method by which the current executable was installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMethod {
-    /// Installed via `cargo install`. Update is performed by running `cargo install` again.
+    /// Installed via `cargo install`. By default, updated by downloading the
+    /// GitHub release binary; falls back to re-running `cargo install` if the
+    /// download fails. See [`UpdateOptions::prefer_github_release`].
     CargoInstall,
     /// A development build found under a `target/` directory.
     DevBuild,
@@ -69,7 +71,7 @@ impl KaishinOptions {
 }
 
 /// Options for the self-update process.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UpdateOptions {
     /// Automatically answer "yes" to all prompts.
     pub yes: bool,
@@ -77,6 +79,25 @@ pub struct UpdateOptions {
     pub check_only: bool,
     /// Run in non-interactive mode. Bail if a prompt would be required and `yes` is false.
     pub non_interactive: bool,
+    /// When the binary was installed via `cargo install`, prefer downloading the
+    /// release binary from GitHub instead of running `cargo install` (which
+    /// rebuilds from source and is slow). Defaults to `true`.
+    ///
+    /// If the GitHub release download fails (e.g., no matching asset for the
+    /// current platform), the update falls back to `cargo install`. Set this
+    /// to `false` to skip the GitHub release attempt entirely.
+    pub prefer_github_release: bool,
+}
+
+impl Default for UpdateOptions {
+    fn default() -> Self {
+        Self {
+            yes: false,
+            check_only: false,
+            non_interactive: false,
+            prefer_github_release: true,
+        }
+    }
 }
 
 impl UpdateOptions {
@@ -100,6 +121,12 @@ impl UpdateOptions {
     /// Sets the `non_interactive` flag.
     pub fn non_interactive(mut self, non_interactive: bool) -> Self {
         self.non_interactive = non_interactive;
+        self
+    }
+
+    /// Sets the `prefer_github_release` flag.
+    pub fn prefer_github_release(mut self, prefer_github_release: bool) -> Self {
+        self.prefer_github_release = prefer_github_release;
         self
     }
 }
@@ -315,7 +342,13 @@ pub fn format_update_banner(opts: &KaishinOptions, latest: &LatestRelease) -> St
 /// 3. If [`UpdateOptions::check_only`] is true, prints status and returns.
 /// 4. If [`UpdateOptions::non_interactive`] is true and [`UpdateOptions::yes`] is false, bails if an update is available.
 /// 5. Prompts the user (if [`UpdateOptions::yes`] is false and terminal is interactive).
-/// 6. Detects the installation method and performs the update accordingly.
+/// 6. Detects the installation method and performs the update accordingly:
+///    - `DevBuild`: errors out (refuses to overwrite a development binary).
+///    - `CargoInstall`: if [`UpdateOptions::prefer_github_release`] is `true`
+///      (the default), downloads the release binary from GitHub and only falls
+///      back to `cargo install` when the GitHub release path fails. If `false`,
+///      runs `cargo install` directly.
+///    - `DirectBinary`: downloads the matching binary from the GitHub release.
 pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> Result<()> {
     let latest = check_latest_release(opts)
         .await
@@ -373,58 +406,78 @@ pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> 
             ));
         }
         InstallMethod::CargoInstall => {
-            let tmp = tempfile::Builder::new()
-                .prefix(&format!("{}-self-update-", opts.bin_name))
-                .tempdir()?;
-            let tmp_root = tmp.path().to_path_buf();
-            println!(
-                "running: cargo install {} --version {} --locked --force --root {}",
-                opts.bin_name,
-                latest_clean,
-                tmp_root.display()
-            );
-            let status = std::process::Command::new("cargo")
-                .arg("install")
-                .arg(&opts.bin_name)
-                .arg("--version")
-                .arg(latest_clean)
-                .arg("--locked")
-                .arg("--force")
-                .arg("--root")
-                .arg(&tmp_root)
-                .status()?;
-            if !status.success() {
-                anyhow::bail!("cargo install failed");
+            if upd_opts.prefer_github_release {
+                match update_via_github_release(opts, &latest) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        eprintln!(
+                            "GitHub release download failed: {e}. Falling back to `cargo install`."
+                        );
+                    }
+                }
             }
-            let bin_exe_name = if cfg!(windows) {
-                format!("{}.exe", opts.bin_name)
-            } else {
-                opts.bin_name.clone()
-            };
-            let new_exe = tmp_root.join("bin").join(bin_exe_name);
-            self_update::self_replace::self_replace(&new_exe)?;
-            println!("\u{2713} {} v{} installed.", opts.bin_name, latest_clean);
+            update_via_cargo_install(opts, latest_clean)?;
         }
         InstallMethod::DirectBinary => {
-            let status = self_update::backends::github::Update::configure()
-                .repo_owner(&opts.owner)
-                .repo_name(&opts.repo)
-                .bin_name(&opts.bin_name)
-                .show_download_progress(true)
-                .current_version(&opts.current_version)
-                .target_version_tag(&latest.tag_name)
-                .build()
-                .map_err(|e| anyhow!("build: {}", e))?
-                .update()
-                .map_err(|e| anyhow!("update: {}", e))?;
-            match status {
-                self_update::Status::UpToDate(v) => {
-                    println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
-                }
-                self_update::Status::Updated(v) => {
-                    println!("\u{2713} {} v{} installed.", opts.bin_name, v)
-                }
-            }
+            update_via_github_release(opts, &latest)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_via_cargo_install(opts: &KaishinOptions, latest_clean: &str) -> Result<()> {
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("{}-self-update-", opts.bin_name))
+        .tempdir()?;
+    let tmp_root = tmp.path().to_path_buf();
+    println!(
+        "running: cargo install {} --version {} --locked --force --root {}",
+        opts.bin_name,
+        latest_clean,
+        tmp_root.display()
+    );
+    let status = std::process::Command::new("cargo")
+        .arg("install")
+        .arg(&opts.bin_name)
+        .arg("--version")
+        .arg(latest_clean)
+        .arg("--locked")
+        .arg("--force")
+        .arg("--root")
+        .arg(&tmp_root)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("cargo install failed");
+    }
+    let bin_exe_name = if cfg!(windows) {
+        format!("{}.exe", opts.bin_name)
+    } else {
+        opts.bin_name.clone()
+    };
+    let new_exe = tmp_root.join("bin").join(bin_exe_name);
+    self_update::self_replace::self_replace(&new_exe)?;
+    println!("\u{2713} {} v{} installed.", opts.bin_name, latest_clean);
+    Ok(())
+}
+
+fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> Result<()> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner(&opts.owner)
+        .repo_name(&opts.repo)
+        .bin_name(&opts.bin_name)
+        .show_download_progress(true)
+        .current_version(&opts.current_version)
+        .target_version_tag(&latest.tag_name)
+        .build()
+        .map_err(|e| anyhow!("build: {}", e))?
+        .update()
+        .map_err(|e| anyhow!("update: {}", e))?;
+    match status {
+        self_update::Status::UpToDate(v) => {
+            println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
+        }
+        self_update::Status::Updated(v) => {
+            println!("\u{2713} {} v{} installed.", opts.bin_name, v)
         }
     }
     Ok(())
@@ -492,6 +545,23 @@ mod tests {
             Duration::from_secs(86400),
             now
         ));
+    }
+
+    #[test]
+    fn test_update_options_defaults() {
+        let opts = UpdateOptions::new();
+        assert!(!opts.yes);
+        assert!(!opts.check_only);
+        assert!(!opts.non_interactive);
+        assert!(opts.prefer_github_release);
+    }
+
+    #[test]
+    fn test_update_options_prefer_github_release_builder() {
+        let opts = UpdateOptions::new().prefer_github_release(false);
+        assert!(!opts.prefer_github_release);
+        let opts = opts.prefer_github_release(true);
+        assert!(opts.prefer_github_release);
     }
 
     #[test]
