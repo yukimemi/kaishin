@@ -468,6 +468,7 @@ fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> R
         .show_download_progress(true)
         .current_version(&opts.current_version)
         .target_version_tag(&latest.tag_name)
+        .no_confirm(true)
         .build()
         .context("build")?
         .update()
