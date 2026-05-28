@@ -198,7 +198,7 @@ impl Checker {
             last_known_url: Some(latest.html_url.clone()),
         };
         let _ = self.save_state(&state);
-        if is_update_available(&self.opts.current_version, &latest.tag_name).unwrap_or(false) {
+        if is_update_available(&self.opts.current_version, &latest.tag_name)? {
             Ok(Some(latest))
         } else {
             Ok(None)
