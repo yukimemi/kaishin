@@ -173,8 +173,20 @@ impl Checker {
         should_auto_check(state.as_ref(), self.interval, SystemTime::now())
     }
 
-    /// Fetches the latest release, saves it to the state file, and returns the result.
-    pub async fn check_and_save(&self) -> Result<LatestRelease> {
+    /// Fetches the latest release, saves it to the state file, and returns the
+    /// result *only when it actually outranks the running version*.
+    ///
+    /// The state file is updated regardless of the comparison result so the
+    /// next [`Checker::should_check`] call throttles correctly. The return
+    /// value mirrors [`Checker::cached_update`]: `Ok(Some(_))` if a newer
+    /// release exists, `Ok(None)` if the running version is already up to date
+    /// (or ahead), and `Err(_)` only if the GitHub request itself failed.
+    ///
+    /// Callers can therefore feed the return value straight into
+    /// [`Checker::format_banner`] without a separate
+    /// [`is_update_available`] check — the asymmetry that bit
+    /// `renri`/`yui` in kaishin 0.3.x is gone.
+    pub async fn check_and_save(&self) -> Result<Option<LatestRelease>> {
         let latest = check_latest_release(&self.opts).await?;
         let now_unix = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -186,7 +198,11 @@ impl Checker {
             last_known_url: Some(latest.html_url.clone()),
         };
         let _ = self.save_state(&state);
-        Ok(latest)
+        if is_update_available(&self.opts.current_version, &latest.tag_name)? {
+            Ok(Some(latest))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns the cached latest release from the state file, if available and newer.
