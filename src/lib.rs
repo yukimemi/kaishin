@@ -525,7 +525,8 @@ fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> R
             // on this system. On musl-only hosts (Alpine, etc.) a gnu binary
             // requires the glibc dynamic linker and won't execute.
             let has_glibc = std::path::Path::new("/lib/x86_64-linux-gnu/libc.so.6").exists()
-                || std::path::Path::new("/lib64/ld-linux-x86-64.so.2").exists();
+                || std::path::Path::new("/lib64/ld-linux-x86-64.so.2").exists()
+                || std::path::Path::new("/lib/ld-linux-x86-64.so.2").exists();
             if has_glibc {
                 if let Ok(()) =
                     try_github_release_with_target(opts, latest, Some("x86_64-unknown-linux-gnu"))
@@ -579,7 +580,11 @@ fn try_github_release_with_target(
     if let Some(t) = target_override {
         builder.target(t);
     }
-    let status = builder.build().context("build")?.update().context("update")?;
+    let status = builder
+        .build()
+        .context("build")?
+        .update()
+        .context("update")?;
     match status {
         self_update::Status::UpToDate(v) => {
             println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
