@@ -391,6 +391,39 @@ pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> 
         return Ok(());
     }
 
+    // The confirmation prompt and the install step both perform synchronous,
+    // blocking I/O. In particular the `self_update` backend creates — and then
+    // drops — its own blocking Tokio runtime. Doing that anywhere inside the
+    // caller's async runtime deadlocks ("Cannot start a runtime from within a
+    // runtime"); even a `spawn_blocking` pool thread is still runtime-attached
+    // and instead trips "Cannot drop a runtime in a context where blocking is
+    // not allowed". This is exactly what froze `shoka`/`renri` mid-update.
+    //
+    // Run the whole blocking tail on a detached OS thread that has *no* Tokio
+    // context at all, and await its result over a oneshot channel. Works on
+    // both multi-thread and current-thread runtimes.
+    let opts = opts.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(format!("{}-self-update", opts.bin_name))
+        .spawn(move || {
+            let _ = tx.send(run_self_update_blocking(&opts, &latest, upd_opts));
+        })
+        .context("failed to spawn self-update worker thread")?;
+    rx.await
+        .context("self-update worker thread exited without reporting a result")?
+}
+
+/// The synchronous, blocking tail of [`run_self_update`]: prompt the user and
+/// perform the actual install. Must run off the async executor (see the call
+/// site) because `self_update`'s backend blocks on its own runtime.
+fn run_self_update_blocking(
+    opts: &KaishinOptions,
+    latest: &LatestRelease,
+    upd_opts: UpdateOptions,
+) -> Result<()> {
+    let latest_clean = latest.tag_name.trim_start_matches('v');
+
     if !upd_opts.yes {
         use std::io::IsTerminal;
         if upd_opts.non_interactive || !std::io::stdin().is_terminal() {
@@ -423,7 +456,7 @@ pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> 
         }
         InstallMethod::CargoInstall => {
             if upd_opts.prefer_github_release {
-                match update_via_github_release(opts, &latest) {
+                match update_via_github_release(opts, latest) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         eprintln!(
@@ -435,7 +468,7 @@ pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> 
             update_via_cargo_install(opts, latest_clean)?;
         }
         InstallMethod::DirectBinary => {
-            update_via_github_release(opts, &latest)?;
+            update_via_github_release(opts, latest)?;
         }
     }
     Ok(())
