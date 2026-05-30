@@ -510,18 +510,62 @@ fn update_via_cargo_install(opts: &KaishinOptions, latest_clean: &str) -> Result
 }
 
 fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> Result<()> {
-    let status = self_update::backends::github::Update::configure()
+    // Try the compiled-in target first (self_update picks it up automatically).
+    let err = match try_github_release_with_target(opts, latest, None) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    // On Linux x86_64, try the alternate libc ABI (musl↔gnu) so that releases
+    // can migrate between them without breaking self-update.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let alt = if cfg!(target_env = "musl") {
+            "x86_64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-musl"
+        };
+        if let Ok(()) = try_github_release_with_target(opts, latest, Some(alt)) {
+            return Ok(());
+        }
+    }
+
+    // On Windows x86_64, try the alternate ABI (gnu↔msvc) for the same reason.
+    // Most releases ship msvc; users who installed via cargo with the GNU
+    // toolchain get a gnu binary that can still upgrade to an msvc release.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        let alt = if cfg!(target_env = "gnu") {
+            "x86_64-pc-windows-msvc"
+        } else {
+            "x86_64-pc-windows-gnu"
+        };
+        if let Ok(()) = try_github_release_with_target(opts, latest, Some(alt)) {
+            return Ok(());
+        }
+    }
+
+    Err(err)
+}
+
+fn try_github_release_with_target(
+    opts: &KaishinOptions,
+    latest: &LatestRelease,
+    target_override: Option<&str>,
+) -> Result<()> {
+    let mut builder = self_update::backends::github::Update::configure();
+    builder
         .repo_owner(&opts.owner)
         .repo_name(&opts.repo)
         .bin_name(&opts.bin_name)
         .show_download_progress(true)
         .current_version(&opts.current_version)
         .target_version_tag(&latest.tag_name)
-        .no_confirm(true)
-        .build()
-        .context("build")?
-        .update()
-        .context("update")?;
+        .no_confirm(true);
+    if let Some(t) = target_override {
+        builder.target(t);
+    }
+    let status = builder.build().context("build")?.update().context("update")?;
     match status {
         self_update::Status::UpToDate(v) => {
             println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
