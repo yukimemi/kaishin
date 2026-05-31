@@ -41,5 +41,14 @@ dirs = "6.0"
 tempfile = "3"
 console = "0.16.3"
 
+# Windows-only: the self-update confirmation prompt forces cooked console
+# input mode (and restores it) so it survives a terminal a prior TUI left in
+# raw mode. See the `cooked_input` module in `lib.rs`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [dev-dependencies]
 tempfile = "3"
