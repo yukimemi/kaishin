@@ -414,6 +414,85 @@ pub async fn run_self_update(opts: &KaishinOptions, upd_opts: UpdateOptions) -> 
         .context("self-update worker thread exited without reporting a result")?
 }
 
+/// Windows console-mode guard for the confirmation prompt.
+///
+/// `read_line` on Windows reads the console via `ReadConsoleW`, which only
+/// returns on Enter (and only echoes / honours Ctrl-C as a signal) when the
+/// console input is in cooked mode — `ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+/// ENABLE_PROCESSED_INPUT`. A program that put the console into raw mode
+/// (e.g. a crossterm/ratatui TUI) and exited without restoring it leaves
+/// those flags cleared *for the whole console*, so a later `self-update` in
+/// the same terminal hangs at `[y/N]` with no echo and an inert Ctrl-C. We
+/// can't trust the inherited mode, so set cooked input for the read and
+/// restore the previous mode on drop.
+#[cfg(windows)]
+mod cooked_input {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode,
+        GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+
+    const COOKED: CONSOLE_MODE = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
+
+    /// Restores the previous console input mode on drop, but only if `guard`
+    /// actually changed it.
+    pub(crate) struct CookedInput {
+        handle: HANDLE,
+        prev: CONSOLE_MODE,
+        restore: bool,
+    }
+
+    impl CookedInput {
+        pub(crate) fn guard() -> Self {
+            // SAFETY: plain FFI calls into the Win32 console API with a
+            // borrowed std handle; no memory is aliased or freed.
+            unsafe {
+                let handle = GetStdHandle(STD_INPUT_HANDLE);
+                let mut prev: CONSOLE_MODE = 0;
+                // `GetConsoleMode` fails when stdin is redirected (a pipe or
+                // file) — there's no console mode to repair, and the
+                // non-interactive guard upstream already covers that path.
+                if handle.is_null() || GetConsoleMode(handle, &mut prev) == 0 {
+                    return Self {
+                        handle,
+                        prev: 0,
+                        restore: false,
+                    };
+                }
+                let cooked = prev | COOKED;
+                // Only touch (and later restore) the mode when something was
+                // actually cleared, so the common healthy case is a no-op.
+                if cooked != prev && SetConsoleMode(handle, cooked) != 0 {
+                    Self {
+                        handle,
+                        prev,
+                        restore: true,
+                    }
+                } else {
+                    Self {
+                        handle,
+                        prev,
+                        restore: false,
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for CookedInput {
+        fn drop(&mut self) {
+            if self.restore {
+                // Best-effort: nothing actionable if the restore fails.
+                // SAFETY: same borrowed console handle as in `guard`.
+                unsafe {
+                    SetConsoleMode(self.handle, self.prev);
+                }
+            }
+        }
+    }
+}
+
 /// The synchronous, blocking tail of [`run_self_update`]: prompt the user and
 /// perform the actual install. Must run off the async executor (see the call
 /// site) because `self_update`'s backend blocks on its own runtime.
@@ -436,6 +515,16 @@ fn run_self_update_blocking(
         eprint!("Update to v{}? [y/N] ", latest_clean);
         use std::io::Write;
         std::io::stderr().flush().ok();
+        // A full-screen TUI (ratatui/crossterm, …) run earlier in the same
+        // console can exit without restoring cooked mode, leaving stdin's
+        // console with ENABLE_LINE_INPUT / ENABLE_ECHO_INPUT /
+        // ENABLE_PROCESSED_INPUT cleared. `read_line` then blocks forever on
+        // an Enter that never terminates the line, and Ctrl-C arrives as a
+        // raw 0x03 byte instead of a signal — the "frozen at [y/N]" hang.
+        // Force a sane mode for the read and restore it after; no-op off
+        // Windows and when stdin isn't a console.
+        #[cfg(windows)]
+        let _cooked_input = cooked_input::CookedInput::guard();
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim().to_ascii_lowercase();
