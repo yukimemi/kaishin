@@ -45,7 +45,7 @@ console = "0.16.3"
 # input mode (and restores it) so it survives a terminal a prior TUI left in
 # raw mode. See the `cooked_input` module in `lib.rs`.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Console",
 ] }
