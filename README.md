@@ -118,8 +118,9 @@ Notes:
 - For a `cargo install`-managed binary, auto-update only swaps the GitHub
   release asset; it never triggers a (slow, noisy) `cargo install` rebuild on
   this path. If no matching asset exists, the update is skipped.
-- Updates are serialised across processes by a lock file, so two instances
-  starting at once won't both self-replace.
+- Updates are serialised across processes by an OS advisory lock, so two
+  instances starting at once won't both self-replace (and the lock is released
+  automatically if a process exits or crashes).
 - Use [`Checker::auto_update`] directly (instead of `spawn_auto_update`) if you
   want to await the result and learn which version was installed.
 

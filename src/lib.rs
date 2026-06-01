@@ -259,11 +259,12 @@ impl Checker {
     ///
     /// ## Concurrency
     ///
-    /// A lock file next to the state file serialises updates across processes
-    /// so two concurrently-starting instances don't both self-replace the same
-    /// binary (which races on Windows in particular). The loser returns
-    /// `Ok(None)`. A lock older than the check interval is treated as stale and
-    /// reclaimed, so a crash mid-update can't disable auto-update permanently.
+    /// An OS advisory lock on a lock file next to the state file serialises
+    /// updates across processes so two concurrently-starting instances don't
+    /// both self-replace the same binary (which races on Windows in
+    /// particular). The loser returns `Ok(None)`. The kernel releases the lock
+    /// when the holder exits — including on a crash — so a failed update can't
+    /// disable auto-update permanently.
     ///
     /// ## Runtime
     ///
@@ -278,7 +279,7 @@ impl Checker {
 
         // Serialise across processes; bail (not error) if someone else holds it.
         let lock_path = self.state_path.with_extension("lock");
-        let Some(_lock) = UpdateLock::acquire(&lock_path, self.interval) else {
+        let Some(_lock) = UpdateLock::acquire(&lock_path) else {
             return Ok(None);
         };
 
@@ -683,48 +684,43 @@ fn run_silent_update_blocking(opts: &KaishinOptions, latest: &LatestRelease) -> 
 /// Cross-process guard so two concurrently-starting instances don't both
 /// self-replace the same binary. Acquisition is fail-open: if the lock can't
 /// be taken, the caller simply skips the update this round.
+///
+/// Backed by an OS advisory file lock (`fs2`) on the lock file rather than a
+/// hand-rolled "create_new + timestamp" scheme. The kernel releases the lock
+/// automatically when the holder's file handle is closed —
+/// including on a crash or kill — so there is no orphaned-lock state to reclaim
+/// and no time-of-check/time-of-use window between a staleness check and the
+/// acquire. The lock file itself is left in place (empty); its mere existence
+/// means nothing, only the live advisory lock does.
 struct UpdateLock {
-    path: PathBuf,
+    // Held only for its `Drop`, which closes the handle and releases the OS
+    // lock. Never read directly.
+    _file: std::fs::File,
 }
 
 impl UpdateLock {
-    /// Tries to acquire the lock at `path`. Returns `None` if another live
-    /// holder has it. A lock older than `stale_after` is treated as orphaned
-    /// (from a crashed update) and reclaimed, so auto-update can't be wedged
-    /// permanently by a single bad run.
-    fn acquire(path: &Path, stale_after: Duration) -> Option<Self> {
-        if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified())
-            && SystemTime::now()
-                .duration_since(modified)
-                .map(|age| age > stale_after)
-                .unwrap_or(true)
-        {
-            let _ = std::fs::remove_file(path);
-        }
+    /// Tries to take the advisory lock at `path`. Returns `None` if another
+    /// process currently holds it (the caller skips the update this round) or
+    /// if the lock file can't be opened.
+    fn acquire(path: &Path) -> Option<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // `create_new` is atomic: exactly one racing process wins the create.
-        match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
             .write(true)
-            .create_new(true)
+            .truncate(false)
             .open(path)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", std::process::id());
-                Some(Self {
-                    path: path.to_path_buf(),
-                })
-            }
+            .ok()?;
+        // `try_lock_exclusive` is non-blocking: `Ok(())` means we hold the
+        // exclusive advisory lock; any error (would-block or otherwise) means
+        // we don't, so we decline rather than wait.
+        use fs2::FileExt;
+        match file.try_lock_exclusive() {
+            Ok(()) => Some(Self { _file: file }),
             Err(_) => None,
         }
-    }
-}
-
-impl Drop for UpdateLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -998,36 +994,21 @@ mod tests {
     fn test_update_lock_mutual_exclusion() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("nested").join("update.lock");
-        let interval = Duration::from_secs(3600);
 
         // First acquire wins and creates the (nested) lock file.
-        let lock = UpdateLock::acquire(&path, interval).expect("first acquire should win");
+        let lock = UpdateLock::acquire(&path).expect("first acquire should win");
         assert!(path.exists());
 
-        // A second concurrent acquire is refused while the lock is held.
-        assert!(UpdateLock::acquire(&path, interval).is_none());
+        // A second acquire from an independent handle is refused while the
+        // advisory lock is held (flock/LockFileEx conflict across handles).
+        assert!(UpdateLock::acquire(&path).is_none());
 
-        // Dropping the guard releases (removes) the lock...
+        // Dropping the guard closes the handle, so the OS releases the lock...
         drop(lock);
-        assert!(!path.exists());
 
-        // ...so a later acquire succeeds again.
-        let lock = UpdateLock::acquire(&path, interval).expect("acquire after release");
-        drop(lock);
-    }
-
-    #[test]
-    fn test_update_lock_reclaims_stale() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("update.lock");
-
-        // Simulate an orphaned lock left by a crashed update.
-        std::fs::write(&path, "12345").unwrap();
-
-        // With a zero staleness window the existing lock is older than the
-        // threshold, so acquisition reclaims it instead of bailing.
-        let lock =
-            UpdateLock::acquire(&path, Duration::ZERO).expect("stale lock should be reclaimable");
+        // ...and a later acquire succeeds again. The lock file itself is left
+        // in place; only the live advisory lock gates acquisition.
+        let lock = UpdateLock::acquire(&path).expect("acquire after release");
         drop(lock);
     }
 }
