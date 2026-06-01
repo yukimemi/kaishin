@@ -14,6 +14,7 @@ Universal self-update library for Rust CLIs, extracted from rvpm and renri.
 - GitHub Releases API integration
 - Automatic installation method detection (cargo install / dev build / direct binary)
 - Background update check with throttling via [`Checker`]
+- Silent background auto-update (Claude-Code style) via [`Checker::auto_update`] / [`Checker::spawn_auto_update`]
 - Customizable update banner
 - Interactive/Non-interactive update flow
 
@@ -83,6 +84,44 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+### Silent Background Auto-Update
+
+Like Claude Code, you can update silently in the background instead of just
+notifying. `spawn_auto_update` fires a detached task that checks, downloads,
+and replaces the binary with no prompts and no output. The running process
+keeps the old binary; the new version takes effect on the next launch.
+
+```rust
+use kaishin::{KaishinOptions, Checker};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let opts = KaishinOptions::new("yukimemi", "rvpm", "rvpm", env!("CARGO_PKG_VERSION"));
+    let checker = Checker::new("rvpm", opts);
+
+    // Fire-and-forget: self-throttled (24h by default), so it's safe to call
+    // on every startup. Opt-out is up to you — gate this behind your own env
+    // var or config if you want users to be able to disable it.
+    if std::env::var_os("RVPM_NO_AUTOUPDATE").is_none() {
+        checker.spawn_auto_update();
+    }
+
+    // ... run app ...
+    Ok(())
+}
+```
+
+Notes:
+
+- A dev build (under `target/`) is never overwritten — the call is a no-op.
+- For a `cargo install`-managed binary, auto-update only swaps the GitHub
+  release asset; it never triggers a (slow, noisy) `cargo install` rebuild on
+  this path. If no matching asset exists, the update is skipped.
+- Updates are serialised across processes by a lock file, so two instances
+  starting at once won't both self-replace.
+- Use [`Checker::auto_update`] directly (instead of `spawn_auto_update`) if you
+  want to await the result and learn which version was installed.
 
 ## License
 
