@@ -5,6 +5,10 @@
 //! 2. Detect how the current executable was installed (e.g., via `cargo install`).
 //! 3. Perform a self-update by replacing the current binary.
 //! 4. Manage background update check intervals to avoid frequent API calls via [`Checker`].
+//! 5. Silently auto-update in the background — check, download, and replace the
+//!    binary without prompting via [`Checker::auto_update`] /
+//!    [`Checker::spawn_auto_update`]. The running process keeps the old binary;
+//!    the new version takes effect on the next launch.
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -222,6 +226,97 @@ impl Checker {
     /// Formats an update banner for the given release.
     pub fn format_banner(&self, latest: &LatestRelease) -> String {
         format_update_banner(&self.opts, latest)
+    }
+
+    /// Silently checks for and installs a newer release in the background.
+    ///
+    /// This is the Claude-Code-style "auto-update" path: no prompts, no
+    /// download progress, no stdout chatter. It is throttled by the same
+    /// [`Checker::interval`] as [`Checker::should_check`], so it is safe to
+    /// call unconditionally on every startup — it hits GitHub at most once per
+    /// interval.
+    ///
+    /// Behaviour:
+    /// - Returns `Ok(None)` immediately if the check interval hasn't elapsed,
+    ///   or if another process already holds the update lock (see below).
+    /// - Fetches the latest release and persists the check timestamp (so the
+    ///   throttle advances even when nothing is installed).
+    /// - If a newer release exists, replaces the binary **silently**:
+    ///   - [`InstallMethod::DevBuild`] → skipped (returns `Ok(None)`); a dev
+    ///     build is never clobbered.
+    ///   - [`InstallMethod::CargoInstall`] and [`InstallMethod::DirectBinary`]
+    ///     → download the matching GitHub release asset and self-replace. A
+    ///     `cargo install` rebuild is **never** triggered on this path (it's
+    ///     slow and noisy); if no release asset matches, the update simply
+    ///     fails and is reported as `Err`.
+    /// - On success returns `Ok(Some(release))` with the installed release.
+    ///   The **running** process keeps the old binary in memory; the new
+    ///   version takes effect on the next launch.
+    ///
+    /// Opt-out is intentionally left to the caller — decide whether to call
+    /// this at all (e.g. gated behind your own env var or config) rather than
+    /// relying on the library to read the environment.
+    ///
+    /// ## Concurrency
+    ///
+    /// An OS advisory lock on a lock file next to the state file serialises
+    /// updates across processes so two concurrently-starting instances don't
+    /// both self-replace the same binary (which races on Windows in
+    /// particular). The loser returns `Ok(None)`. The kernel releases the lock
+    /// when the holder exits — including on a crash — so a failed update can't
+    /// disable auto-update permanently.
+    ///
+    /// ## Runtime
+    ///
+    /// The actual install runs on a detached OS thread with no Tokio context,
+    /// for the same reason as [`run_self_update`] — `self_update`'s backend
+    /// spins up (and drops) its own blocking runtime, which deadlocks inside an
+    /// async executor.
+    pub async fn auto_update(&self) -> Result<Option<LatestRelease>> {
+        if !self.should_check() {
+            return Ok(None);
+        }
+
+        // Serialise across processes; bail (not error) if someone else holds it.
+        let lock_path = self.state_path.with_extension("lock");
+        let Some(_lock) = UpdateLock::acquire(&lock_path) else {
+            return Ok(None);
+        };
+
+        // Advances the throttle even when there's no newer release.
+        let Some(latest) = self.check_and_save().await? else {
+            return Ok(None);
+        };
+
+        let opts = self.opts.clone();
+        let latest_for_thread = latest.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name(format!("{}-auto-update", opts.bin_name))
+            .spawn(move || {
+                let _ = tx.send(run_silent_update_blocking(&opts, &latest_for_thread));
+            })
+            .context("failed to spawn auto-update worker thread")?;
+        let installed = rx
+            .await
+            .context("auto-update worker thread exited without reporting a result")??;
+
+        Ok(installed.then_some(latest))
+    }
+
+    /// Fire-and-forget wrapper around [`Checker::auto_update`].
+    ///
+    /// Spawns a detached Tokio task and returns immediately so application
+    /// startup isn't blocked on a network round-trip or a download. Any error
+    /// (and the installed-version result) is discarded — use
+    /// [`Checker::auto_update`] directly if you need to react to either.
+    ///
+    /// Must be called from within a Tokio runtime.
+    pub fn spawn_auto_update(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _ = this.auto_update().await;
+        });
     }
 
     fn load_state(&self) -> Option<UpdateCheckState> {
@@ -545,7 +640,7 @@ fn run_self_update_blocking(
         }
         InstallMethod::CargoInstall => {
             if upd_opts.prefer_github_release {
-                match update_via_github_release(opts, latest) {
+                match update_via_github_release(opts, latest, true) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         eprintln!(
@@ -557,10 +652,76 @@ fn run_self_update_blocking(
             update_via_cargo_install(opts, latest_clean)?;
         }
         InstallMethod::DirectBinary => {
-            update_via_github_release(opts, latest)?;
+            update_via_github_release(opts, latest, true)?;
         }
     }
     Ok(())
+}
+
+/// The silent, blocking tail of [`Checker::auto_update`]: install the newer
+/// release without any prompt or stdout output. Must run off the async
+/// executor (see the call site) for the same reason as
+/// [`run_self_update_blocking`].
+///
+/// Returns `Ok(true)` if the binary was replaced, `Ok(false)` if the install
+/// was skipped because the running binary is a development build. Unlike the
+/// interactive [`InstallMethod::CargoInstall`] path, a `cargo install` rebuild
+/// is never attempted here: auto-update sticks to the GitHub release asset and
+/// reports `Err` if none matches.
+fn run_silent_update_blocking(opts: &KaishinOptions, latest: &LatestRelease) -> Result<bool> {
+    let exe = std::env::current_exe().context("failed to resolve current_exe()")?;
+    match detect_install_method(&exe) {
+        // Never clobber a dev build, and never surface it as an error on the
+        // background path — just decline.
+        InstallMethod::DevBuild => Ok(false),
+        InstallMethod::CargoInstall | InstallMethod::DirectBinary => {
+            update_via_github_release(opts, latest, false)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Cross-process guard so two concurrently-starting instances don't both
+/// self-replace the same binary. Acquisition is fail-open: if the lock can't
+/// be taken, the caller simply skips the update this round.
+///
+/// Backed by an OS advisory file lock (`fs2`) on the lock file rather than a
+/// hand-rolled "create_new + timestamp" scheme. The kernel releases the lock
+/// automatically when the holder's file handle is closed —
+/// including on a crash or kill — so there is no orphaned-lock state to reclaim
+/// and no time-of-check/time-of-use window between a staleness check and the
+/// acquire. The lock file itself is left in place (empty); its mere existence
+/// means nothing, only the live advisory lock does.
+struct UpdateLock {
+    // Held only for its `Drop`, which closes the handle and releases the OS
+    // lock. Never read directly.
+    _file: std::fs::File,
+}
+
+impl UpdateLock {
+    /// Tries to take the advisory lock at `path`. Returns `None` if another
+    /// process currently holds it (the caller skips the update this round) or
+    /// if the lock file can't be opened.
+    fn acquire(path: &Path) -> Option<Self> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        // `try_lock_exclusive` is non-blocking: `Ok(())` means we hold the
+        // exclusive advisory lock; any error (would-block or otherwise) means
+        // we don't, so we decline rather than wait.
+        use fs2::FileExt;
+        match file.try_lock_exclusive() {
+            Ok(()) => Some(Self { _file: file }),
+            Err(_) => None,
+        }
+    }
 }
 
 fn update_via_cargo_install(opts: &KaishinOptions, latest_clean: &str) -> Result<()> {
@@ -598,9 +759,13 @@ fn update_via_cargo_install(opts: &KaishinOptions, latest_clean: &str) -> Result
     Ok(())
 }
 
-fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> Result<()> {
+fn update_via_github_release(
+    opts: &KaishinOptions,
+    latest: &LatestRelease,
+    show_progress: bool,
+) -> Result<()> {
     // Try the compiled-in target first (self_update picks it up automatically).
-    let err = match try_github_release_with_target(opts, latest, None) {
+    let err = match try_github_release_with_target(opts, latest, None, show_progress) {
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
@@ -617,18 +782,24 @@ fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> R
                 || std::path::Path::new("/lib64/ld-linux-x86-64.so.2").exists()
                 || std::path::Path::new("/lib/ld-linux-x86-64.so.2").exists();
             if has_glibc {
-                if let Ok(()) =
-                    try_github_release_with_target(opts, latest, Some("x86_64-unknown-linux-gnu"))
-                {
+                if let Ok(()) = try_github_release_with_target(
+                    opts,
+                    latest,
+                    Some("x86_64-unknown-linux-gnu"),
+                    show_progress,
+                ) {
                     return Ok(());
                 }
             }
         } else {
             // gnu binary falling back to musl: always safe — musl static
             // binaries carry their own libc and run on any Linux kernel.
-            if let Ok(()) =
-                try_github_release_with_target(opts, latest, Some("x86_64-unknown-linux-musl"))
-            {
+            if let Ok(()) = try_github_release_with_target(
+                opts,
+                latest,
+                Some("x86_64-unknown-linux-musl"),
+                show_progress,
+            ) {
                 return Ok(());
             }
         }
@@ -644,7 +815,7 @@ fn update_via_github_release(opts: &KaishinOptions, latest: &LatestRelease) -> R
         } else {
             "x86_64-pc-windows-gnu"
         };
-        if let Ok(()) = try_github_release_with_target(opts, latest, Some(alt)) {
+        if let Ok(()) = try_github_release_with_target(opts, latest, Some(alt), show_progress) {
             return Ok(());
         }
     }
@@ -656,13 +827,14 @@ fn try_github_release_with_target(
     opts: &KaishinOptions,
     latest: &LatestRelease,
     target_override: Option<&str>,
+    show_progress: bool,
 ) -> Result<()> {
     let mut builder = self_update::backends::github::Update::configure();
     builder
         .repo_owner(&opts.owner)
         .repo_name(&opts.repo)
         .bin_name(&opts.bin_name)
-        .show_download_progress(true)
+        .show_download_progress(show_progress)
         .current_version(&opts.current_version)
         .target_version_tag(&latest.tag_name)
         .no_confirm(true);
@@ -674,12 +846,16 @@ fn try_github_release_with_target(
         .context("build")?
         .update()
         .context("update")?;
-    match status {
-        self_update::Status::UpToDate(v) => {
-            println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
-        }
-        self_update::Status::Updated(v) => {
-            println!("\u{2713} {} v{} installed.", opts.bin_name, v)
+    // Stay silent on the background auto-update path (`show_progress == false`);
+    // the interactive flows keep their confirmation output.
+    if show_progress {
+        match status {
+            self_update::Status::UpToDate(v) => {
+                println!("\u{2713} {} {} is already up to date.", opts.bin_name, v)
+            }
+            self_update::Status::Updated(v) => {
+                println!("\u{2713} {} v{} installed.", opts.bin_name, v)
+            }
         }
     }
     Ok(())
@@ -812,5 +988,27 @@ mod tests {
         // Test banner from checker
         let banner = checker.format_banner(&cached);
         assert!(banner.contains("app 1.2.0 available"));
+    }
+
+    #[test]
+    fn test_update_lock_mutual_exclusion() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("nested").join("update.lock");
+
+        // First acquire wins and creates the (nested) lock file.
+        let lock = UpdateLock::acquire(&path).expect("first acquire should win");
+        assert!(path.exists());
+
+        // A second acquire from an independent handle is refused while the
+        // advisory lock is held (flock/LockFileEx conflict across handles).
+        assert!(UpdateLock::acquire(&path).is_none());
+
+        // Dropping the guard closes the handle, so the OS releases the lock...
+        drop(lock);
+
+        // ...and a later acquire succeeds again. The lock file itself is left
+        // in place; only the live advisory lock gates acquisition.
+        let lock = UpdateLock::acquire(&path).expect("acquire after release");
+        drop(lock);
     }
 }
