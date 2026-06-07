@@ -40,6 +40,10 @@ async fn main() -> Result<()> {
         "my-tool",
         env!("CARGO_PKG_VERSION")
     );
+    // If the crates.io package name differs from the binary name
+    // (e.g. package `my-tool-cli` ships the binary `my-tool`), tell
+    // the `cargo install` fallback which package to build:
+    // let opts = opts.crate_name("my-tool-cli");
     let upd_opts = UpdateOptions::new()
         .yes(args.yes)
         .check_only(args.check)

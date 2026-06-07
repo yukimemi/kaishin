@@ -60,6 +60,11 @@ pub struct KaishinOptions {
     pub bin_name: String,
     /// The current version of the application (usually `env!("CARGO_PKG_VERSION")`).
     pub current_version: String,
+    /// The crates.io package name, when it differs from `bin_name`
+    /// (e.g., package `kotonoha-server` ships the binary `kotonoha`).
+    /// Used by the `cargo install` fallback; `None` means the package
+    /// is named like the binary.
+    pub crate_name: Option<String>,
 }
 
 impl KaishinOptions {
@@ -70,7 +75,21 @@ impl KaishinOptions {
             repo: repo.to_string(),
             bin_name: bin_name.to_string(),
             current_version: current_version.to_string(),
+            crate_name: None,
         }
+    }
+
+    /// Sets the crates.io package name for when it differs from the
+    /// binary name (used by the `cargo install` fallback).
+    pub fn crate_name(mut self, crate_name: &str) -> Self {
+        self.crate_name = Some(crate_name.to_string());
+        self
+    }
+
+    /// The package name to pass to `cargo install` — the explicit
+    /// `crate_name` when set, the binary name otherwise.
+    pub fn cargo_crate_name(&self) -> &str {
+        self.crate_name.as_deref().unwrap_or(&self.bin_name)
     }
 }
 
@@ -729,15 +748,19 @@ fn update_via_cargo_install(opts: &KaishinOptions, latest_clean: &str) -> Result
         .prefix(&format!("{}-self-update-", opts.bin_name))
         .tempdir()?;
     let tmp_root = tmp.path().to_path_buf();
+    // The cargo *package* name can differ from the binary name (e.g.
+    // package `kotonoha-server`, binary `kotonoha`). The package name
+    // goes to `cargo install`; the binary lookup below stays on
+    // `bin_name`, because that's what cargo puts under `<root>/bin/`.
     println!(
         "running: cargo install {} --version {} --locked --force --root {}",
-        opts.bin_name,
+        opts.cargo_crate_name(),
         latest_clean,
         tmp_root.display()
     );
     let status = std::process::Command::new("cargo")
         .arg("install")
-        .arg(&opts.bin_name)
+        .arg(opts.cargo_crate_name())
         .arg("--version")
         .arg(latest_clean)
         .arg("--locked")
@@ -823,17 +846,52 @@ fn update_via_github_release(
     Err(err)
 }
 
+/// In-archive binary paths to try, in order. Release archives built by
+/// the kata `pj-rust-cli` template contain the binary renamed with the
+/// target-triple suffix (`<bin>-<target>[.exe]`, matching the archive
+/// stem); older / hand-rolled releases ship the plain `<bin>[.exe]`.
+/// `self_update` expands `{{ bin }}` / `{{ target }}` at update time.
+///
+/// Each failed attempt re-downloads the asset, so the common layout
+/// (kata) goes first.
+fn bin_path_in_archive_templates() -> [&'static str; 2] {
+    if cfg!(windows) {
+        ["{{ bin }}-{{ target }}.exe", "{{ bin }}.exe"]
+    } else {
+        ["{{ bin }}-{{ target }}", "{{ bin }}"]
+    }
+}
+
 fn try_github_release_with_target(
     opts: &KaishinOptions,
     latest: &LatestRelease,
     target_override: Option<&str>,
     show_progress: bool,
 ) -> Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for bin_path in bin_path_in_archive_templates() {
+        match try_github_release_once(opts, latest, target_override, show_progress, bin_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // The loop always runs at least once, so `last_err` is Some here.
+    Err(last_err.unwrap_or_else(|| anyhow!("no bin-path-in-archive candidates")))
+}
+
+fn try_github_release_once(
+    opts: &KaishinOptions,
+    latest: &LatestRelease,
+    target_override: Option<&str>,
+    show_progress: bool,
+    bin_path_in_archive: &str,
+) -> Result<()> {
     let mut builder = self_update::backends::github::Update::configure();
     builder
         .repo_owner(&opts.owner)
         .repo_name(&opts.repo)
         .bin_name(&opts.bin_name)
+        .bin_path_in_archive(bin_path_in_archive)
         .show_download_progress(show_progress)
         .current_version(&opts.current_version)
         .target_version_tag(&latest.tag_name)
@@ -887,6 +945,36 @@ mod tests {
         assert!(!is_update_available("0.1.2", "v0.1.1").unwrap());
         // No 'v' prefix
         assert!(is_update_available("0.1.0", "0.1.1").unwrap());
+    }
+
+    #[test]
+    fn test_cargo_crate_name_defaults_to_bin_name() {
+        let opts = KaishinOptions::new("u", "r", "app", "1.0.0");
+        assert_eq!(opts.cargo_crate_name(), "app");
+    }
+
+    #[test]
+    fn test_cargo_crate_name_uses_explicit_crate_name() {
+        let opts = KaishinOptions::new("yukimemi", "kotonoha", "kotonoha", "0.3.0")
+            .crate_name("kotonoha-server");
+        assert_eq!(opts.cargo_crate_name(), "kotonoha-server");
+        // The binary name is untouched — `<root>/bin/<bin_name>` lookup
+        // after `cargo install` must keep using it.
+        assert_eq!(opts.bin_name, "kotonoha");
+    }
+
+    #[test]
+    fn test_bin_path_templates_try_kata_layout_first() {
+        let [first, second] = bin_path_in_archive_templates();
+        // Target-suffixed (kata pj-rust-cli layout) before plain.
+        assert!(first.contains("{{ bin }}-{{ target }}"));
+        assert!(second.starts_with("{{ bin }}"));
+        assert!(!second.contains("{{ target }}"));
+        if cfg!(windows) {
+            assert!(first.ends_with(".exe") && second.ends_with(".exe"));
+        } else {
+            assert!(!first.ends_with(".exe") && !second.ends_with(".exe"));
+        }
     }
 
     #[test]
