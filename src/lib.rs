@@ -893,6 +893,12 @@ fn try_github_release_once(
         .bin_name(&opts.bin_name)
         .bin_path_in_archive(bin_path_in_archive)
         .show_download_progress(show_progress)
+        // `show_output` (defaults true) controls self_update's own status
+        // chatter ("Checking latest version...", "Downloading...", …),
+        // independent of the progress bar above. Keep it in sync so the silent
+        // background auto-update path stays quiet — without this a plain
+        // `shoka cd` leaks a full self-update transcript mid-command.
+        .show_output(show_progress)
         .current_version(&opts.current_version)
         .target_version_tag(&latest.tag_name)
         .no_confirm(true);
