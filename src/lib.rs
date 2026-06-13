@@ -57,6 +57,13 @@ pub struct KaishinOptions {
     /// The GitHub repository name (e.g., `rvpm`).
     pub repo: String,
     /// The binary name of the application (e.g., `rvpm`).
+    ///
+    /// Also drives self-update asset matching: GitHub-release assets must be
+    /// named `<bin_name>-<target>.<ext>` (the pj-rust-cli kata layout) for the
+    /// download path to single them out. Assets named otherwise won't match;
+    /// only the interactive [`InstallMethod::CargoInstall`] flow may then fall
+    /// back to `cargo install`, while `DirectBinary` and silent auto-update
+    /// report failure / skip without rebuilding.
     pub bin_name: String,
     /// The current version of the application (usually `env!("CARGO_PKG_VERSION")`).
     pub current_version: String,
@@ -879,6 +886,17 @@ fn try_github_release_with_target(
     Err(last_err.unwrap_or_else(|| anyhow!("no bin-path-in-archive candidates")))
 }
 
+/// The `identifier` handed to `self_update` to disambiguate which asset to
+/// download when a release ships several binaries from the same crate.
+///
+/// `self_update` `contains`-matches this against each asset name, so anchoring
+/// the binary name directly to the target triple (`<bin>-<target>`) is what
+/// separates `kanade-<target>.zip` from a sibling `kanade-agent-<target>.zip`:
+/// the latter contains `kanade` and the target, but not `kanade-<target>`.
+fn asset_identifier(bin_name: &str, target: &str) -> String {
+    format!("{bin_name}-{target}")
+}
+
 fn try_github_release_once(
     opts: &KaishinOptions,
     latest: &LatestRelease,
@@ -886,11 +904,24 @@ fn try_github_release_once(
     show_progress: bool,
     bin_path_in_archive: &str,
 ) -> Result<()> {
+    // Disambiguate sibling binaries with an `<bin>-<target>` identifier (see
+    // `asset_identifier`). The effective target must mirror what self_update
+    // itself uses: the override when set, otherwise its compiled-in target.
+    // This stays a `match` rather than
+    // `target_override.unwrap_or_else(self_update::get_target)`: unifying the
+    // closure's `&'static str` return with the `&'_ str` arm forces
+    // `target_override` to `'static`, which doesn't compile (E0521).
+    let effective_target = match target_override {
+        Some(t) => t,
+        None => self_update::get_target(),
+    };
+    let identifier = asset_identifier(&opts.bin_name, effective_target);
     let mut builder = self_update::backends::github::Update::configure();
     builder
         .repo_owner(&opts.owner)
         .repo_name(&opts.repo)
         .bin_name(&opts.bin_name)
+        .identifier(&identifier)
         .bin_path_in_archive(bin_path_in_archive)
         .show_download_progress(show_progress)
         // `show_output` (defaults true) controls self_update's own status
@@ -967,6 +998,28 @@ mod tests {
         // The binary name is untouched — `<root>/bin/<bin_name>` lookup
         // after `cargo install` must keep using it.
         assert_eq!(opts.bin_name, "kotonoha");
+    }
+
+    #[test]
+    fn test_asset_identifier_disambiguates_sibling_binaries() {
+        // Regression for the kanade self-update falling back to `cargo install`:
+        // self_update `contains`-matches the identifier against asset names, so
+        // the identifier must single out `<bin>-<target>` over a sibling
+        // `<bin>-agent-<target>` that also contains the bare bin name + target.
+        let target = "x86_64-pc-windows-msvc";
+        let id = asset_identifier("kanade", target);
+
+        let right = format!("kanade-{target}.zip");
+        let sibling = format!("kanade-agent-{target}.zip");
+
+        // self_update keeps assets whose name `contains` the id (which itself
+        // embeds the target, so `contains(target)` is implied).
+        assert!(right.contains(&id));
+        assert!(sibling.contains(target));
+        assert!(
+            !sibling.contains(&id),
+            "sibling `{sibling}` must not match identifier `{id}`"
+        );
     }
 
     #[test]
