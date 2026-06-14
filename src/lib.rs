@@ -857,15 +857,43 @@ fn update_via_github_release(
 /// the kata `pj-rust-cli` template contain the binary renamed with the
 /// target-triple suffix (`<bin>-<target>[.exe]`, matching the archive
 /// stem); older / hand-rolled releases ship the plain `<bin>[.exe]`.
-/// `self_update` expands `{{ bin }}` / `{{ target }}` at update time.
+///
+/// These are *fully resolved literals*, deliberately **not** `self_update`'s
+/// `{{ bin }}` / `{{ target }}` templates. `self_update`'s `bin_name()` forces
+/// the platform exe suffix onto the name (`kanade` → `kanade.exe` on Windows)
+/// and then expands `{{ bin }}` to that suffixed value — so
+/// `{{ bin }}-{{ target }}.exe` expands to the never-matching
+/// `kanade.exe-<target>.exe`, leaving every Windows self-update to fail
+/// extraction and fall back to `cargo install`. Building the path ourselves
+/// from the raw `bin_name` + the effective target sidesteps the suffix entirely
+/// (`EXE_SUFFIX` is `.exe` on Windows, empty elsewhere). The alternate-ABI
+/// retries only ever swap to a same-OS target, so the host `EXE_SUFFIX` always
+/// matches the override target's OS.
 ///
 /// Each failed attempt re-downloads the asset, so the common layout
 /// (kata) goes first.
-fn bin_path_in_archive_templates() -> [&'static str; 2] {
-    if cfg!(windows) {
-        ["{{ bin }}-{{ target }}.exe", "{{ bin }}.exe"]
+///
+/// `bin_name` is expected already-bare (see [`strip_exe_suffix`]); the
+/// host `EXE_SUFFIX` is the only suffix appended.
+fn bin_path_in_archive_candidates(bin_name: &str, target: &str) -> [String; 2] {
+    let exe = std::env::consts::EXE_SUFFIX;
+    [
+        format!("{bin_name}-{target}{exe}"),
+        format!("{bin_name}{exe}"),
+    ]
+}
+
+/// Strip a trailing platform exe suffix from `bin_name` (a no-op when `exe`
+/// is empty, i.e. off Windows). A caller that baked `.exe` into its
+/// configured `bin_name` would otherwise double it — `kanade.exe-<target>.exe`
+/// for the archive path, `kanade.exe-<target>` for the asset identifier —
+/// neither of which matches the kata layout. `exe` is a parameter rather than
+/// read inline so the Windows behaviour is unit-testable on non-Windows CI.
+fn strip_exe_suffix<'a>(bin_name: &'a str, exe: &str) -> &'a str {
+    if exe.is_empty() {
+        bin_name
     } else {
-        ["{{ bin }}-{{ target }}", "{{ bin }}"]
+        bin_name.strip_suffix(exe).unwrap_or(bin_name)
     }
 }
 
@@ -875,9 +903,27 @@ fn try_github_release_with_target(
     target_override: Option<&str>,
     show_progress: bool,
 ) -> Result<()> {
+    // The effective target must mirror what self_update itself uses: the
+    // override when set, otherwise its compiled-in target.
+    let effective_target = target_override.unwrap_or_else(|| self_update::get_target());
+    // self_update force-appends EXE_SUFFIX to bin_name internally; if a caller
+    // also baked `.exe` into `opts.bin_name`, strip it here so neither the
+    // identifier nor the in-archive path doubles the suffix.
+    let bin_name = strip_exe_suffix(&opts.bin_name, std::env::consts::EXE_SUFFIX);
+    // Disambiguate sibling binaries with an `<bin>-<target>` identifier (see
+    // `asset_identifier`); both the identifier and the in-archive paths key off
+    // the same effective target.
+    let identifier = asset_identifier(bin_name, effective_target);
     let mut last_err: Option<anyhow::Error> = None;
-    for bin_path in bin_path_in_archive_templates() {
-        match try_github_release_once(opts, latest, target_override, show_progress, bin_path) {
+    for bin_path in bin_path_in_archive_candidates(bin_name, effective_target) {
+        match try_github_release_once(
+            opts,
+            latest,
+            target_override,
+            show_progress,
+            &identifier,
+            &bin_path,
+        ) {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
@@ -902,26 +948,15 @@ fn try_github_release_once(
     latest: &LatestRelease,
     target_override: Option<&str>,
     show_progress: bool,
+    identifier: &str,
     bin_path_in_archive: &str,
 ) -> Result<()> {
-    // Disambiguate sibling binaries with an `<bin>-<target>` identifier (see
-    // `asset_identifier`). The effective target must mirror what self_update
-    // itself uses: the override when set, otherwise its compiled-in target.
-    // This stays a `match` rather than
-    // `target_override.unwrap_or_else(self_update::get_target)`: unifying the
-    // closure's `&'static str` return with the `&'_ str` arm forces
-    // `target_override` to `'static`, which doesn't compile (E0521).
-    let effective_target = match target_override {
-        Some(t) => t,
-        None => self_update::get_target(),
-    };
-    let identifier = asset_identifier(&opts.bin_name, effective_target);
     let mut builder = self_update::backends::github::Update::configure();
     builder
         .repo_owner(&opts.owner)
         .repo_name(&opts.repo)
         .bin_name(&opts.bin_name)
-        .identifier(&identifier)
+        .identifier(identifier)
         .bin_path_in_archive(bin_path_in_archive)
         .show_download_progress(show_progress)
         // `show_output` (defaults true) controls self_update's own status
@@ -1023,17 +1058,40 @@ mod tests {
     }
 
     #[test]
-    fn test_bin_path_templates_try_kata_layout_first() {
-        let [first, second] = bin_path_in_archive_templates();
-        // Target-suffixed (kata pj-rust-cli layout) before plain.
-        assert!(first.contains("{{ bin }}-{{ target }}"));
-        assert!(second.starts_with("{{ bin }}"));
-        assert!(!second.contains("{{ target }}"));
-        if cfg!(windows) {
-            assert!(first.ends_with(".exe") && second.ends_with(".exe"));
-        } else {
-            assert!(!first.ends_with(".exe") && !second.ends_with(".exe"));
-        }
+    fn test_bin_path_candidates_try_kata_layout_first() {
+        let target = "x86_64-pc-windows-msvc";
+        let [first, second] = bin_path_in_archive_candidates("kanade", target);
+        let exe = std::env::consts::EXE_SUFFIX;
+
+        // Target-suffixed (kata pj-rust-cli layout) before plain, both fully
+        // resolved literals — no `{{ … }}` templates leak through.
+        assert_eq!(first, format!("kanade-{target}{exe}"));
+        assert_eq!(second, format!("kanade{exe}"));
+        assert!(!first.contains("{{") && !second.contains("{{"));
+    }
+
+    #[test]
+    fn test_strip_exe_suffix_prevents_double_suffix() {
+        // Platform-independent regression for the Windows self-update fallback
+        // to `cargo install`: feeding the *bare* name through the candidate
+        // builder must produce `kanade-<target>.exe`, never the doubled-suffix
+        // `kanade.exe-<target>.exe`. Driven with an explicit `.exe` so the
+        // Windows path is provably exercised even on Linux CI runners (where
+        // `EXE_SUFFIX` is empty and `cfg!(windows)` would skip it).
+        let target = "x86_64-pc-windows-msvc";
+
+        // A caller-baked `.exe` is stripped back to the bare name…
+        assert_eq!(strip_exe_suffix("kanade.exe", ".exe"), "kanade");
+        assert_eq!(strip_exe_suffix("kanade", ".exe"), "kanade");
+        // …and an empty suffix (Unix) is a no-op.
+        assert_eq!(strip_exe_suffix("kanade", ""), "kanade");
+        assert_eq!(strip_exe_suffix("kanade.exe", ""), "kanade.exe");
+
+        // The doubled-suffix path must never be produced from a bare name.
+        let bare = strip_exe_suffix("kanade.exe", ".exe");
+        let kata = format!("{bare}-{target}.exe");
+        assert_eq!(kata, format!("kanade-{target}.exe"));
+        assert!(!kata.contains(".exe-"), "must not embed `.exe` mid-path");
     }
 
     #[test]
