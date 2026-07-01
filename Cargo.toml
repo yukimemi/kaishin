@@ -39,7 +39,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 ] }
 dirs = "6.0"
 tempfile = "3"
-console = "0.16.3"
+console = "0.16.4"
 # Cross-process advisory file locking for the background auto-update guard.
 # `std::fs::File::try_lock` would do the same but is only stable since Rust
 # 1.89, above this crate's MSRV (1.85), so use the crate instead.
