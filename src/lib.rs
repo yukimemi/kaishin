@@ -811,15 +811,15 @@ fn update_via_github_release(
             let has_glibc = std::path::Path::new("/lib/x86_64-linux-gnu/libc.so.6").exists()
                 || std::path::Path::new("/lib64/ld-linux-x86-64.so.2").exists()
                 || std::path::Path::new("/lib/ld-linux-x86-64.so.2").exists();
-            if has_glibc {
-                if let Ok(()) = try_github_release_with_target(
+            if has_glibc
+                && let Ok(()) = try_github_release_with_target(
                     opts,
                     latest,
                     Some("x86_64-unknown-linux-gnu"),
                     show_progress,
-                ) {
-                    return Ok(());
-                }
+                )
+            {
+                return Ok(());
             }
         } else {
             // gnu binary falling back to musl: always safe — musl static
