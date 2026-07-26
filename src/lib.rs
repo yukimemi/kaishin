@@ -380,10 +380,10 @@ pub fn detect_install_method(exe: &Path) -> InstallMethod {
                 .replace('\\', "/")
                 .to_lowercase()
         });
-    if let Some(bin) = cargo_bin {
-        if s.starts_with(&format!("{}/", bin)) {
-            return InstallMethod::CargoInstall;
-        }
+    if let Some(bin) = cargo_bin
+        && s.starts_with(&format!("{}/", bin))
+    {
+        return InstallMethod::CargoInstall;
     }
     if s.contains("/.cargo/bin/") || s.contains("/cargo/bin/") {
         return InstallMethod::CargoInstall;
@@ -853,10 +853,21 @@ fn update_via_github_release(
     Err(err)
 }
 
-/// In-archive binary paths to try, in order. Release archives built by
-/// the kata `pj-rust-cli` template contain the binary renamed with the
-/// target-triple suffix (`<bin>-<target>[.exe]`, matching the archive
-/// stem); older / hand-rolled releases ship the plain `<bin>[.exe]`.
+/// In-archive binary paths to try, in order: plain `<bin>[.exe]` first,
+/// target-suffixed `<bin>-<target>[.exe]` second.
+///
+/// The target triple in a kata `pj-rust-cli` release lands on the *archive*
+/// name, **not** on the binary inside it — the packaging step feeds the plain
+/// `$BIN_NAME.exe` into an archive it names `$BIN_NAME-<target>.zip` (same for
+/// the unix `tar czf … -C "$pkg" "$BIN_NAME"` arm). Every consumer release
+/// checked ships the plain layout: `shoka.exe` inside
+/// `shoka-x86_64-pc-windows-msvc.zip`, `renri.exe` inside its own, and so on.
+///
+/// Ordering matters because each failed candidate re-downloads the whole
+/// asset, so trying the suffixed name first burned one full download on every
+/// self-update across the fleet. The suffixed candidate is kept as a second
+/// chance for any release that does rename the inner binary to match its
+/// archive stem.
 ///
 /// These are *fully resolved literals*, deliberately **not** `self_update`'s
 /// `{{ bin }}` / `{{ target }}` templates. `self_update`'s `bin_name()` forces
@@ -870,25 +881,23 @@ fn update_via_github_release(
 /// retries only ever swap to a same-OS target, so the host `EXE_SUFFIX` always
 /// matches the override target's OS.
 ///
-/// Each failed attempt re-downloads the asset, so the common layout
-/// (kata) goes first.
-///
 /// `bin_name` is expected already-bare (see [`strip_exe_suffix`]); the
 /// host `EXE_SUFFIX` is the only suffix appended.
 fn bin_path_in_archive_candidates(bin_name: &str, target: &str) -> [String; 2] {
     let exe = std::env::consts::EXE_SUFFIX;
     [
-        format!("{bin_name}-{target}{exe}"),
         format!("{bin_name}{exe}"),
+        format!("{bin_name}-{target}{exe}"),
     ]
 }
 
 /// Strip a trailing platform exe suffix from `bin_name` (a no-op when `exe`
 /// is empty, i.e. off Windows). A caller that baked `.exe` into its
-/// configured `bin_name` would otherwise double it — `kanade.exe-<target>.exe`
-/// for the archive path, `kanade.exe-<target>` for the asset identifier —
-/// neither of which matches the kata layout. `exe` is a parameter rather than
-/// read inline so the Windows behaviour is unit-testable on non-Windows CI.
+/// configured `bin_name` would otherwise double it — `kanade.exe.exe` /
+/// `kanade.exe-<target>.exe` for the in-archive paths, `kanade.exe-<target>`
+/// for the asset identifier — none of which match a released archive. `exe` is
+/// a parameter rather than read inline so the Windows behaviour is
+/// unit-testable on non-Windows CI.
 fn strip_exe_suffix<'a>(bin_name: &'a str, exe: &str) -> &'a str {
     if exe.is_empty() {
         bin_name
@@ -1058,15 +1067,18 @@ mod tests {
     }
 
     #[test]
-    fn test_bin_path_candidates_try_kata_layout_first() {
+    fn test_bin_path_candidates_try_plain_layout_first() {
         let target = "x86_64-pc-windows-msvc";
         let [first, second] = bin_path_in_archive_candidates("kanade", target);
         let exe = std::env::consts::EXE_SUFFIX;
 
-        // Target-suffixed (kata pj-rust-cli layout) before plain, both fully
-        // resolved literals — no `{{ … }}` templates leak through.
-        assert_eq!(first, format!("kanade-{target}{exe}"));
-        assert_eq!(second, format!("kanade{exe}"));
+        // Plain before target-suffixed: kata `pj-rust-cli` puts the triple on the
+        // archive name, not on the binary inside it, so every real release ships
+        // the plain layout and a suffixed-first order wastes one full asset
+        // download per self-update. Both are fully resolved literals — no
+        // `{{ … }}` templates leak through.
+        assert_eq!(first, format!("kanade{exe}"));
+        assert_eq!(second, format!("kanade-{target}{exe}"));
         assert!(!first.contains("{{") && !second.contains("{{"));
     }
 
@@ -1089,9 +1101,13 @@ mod tests {
 
         // The doubled-suffix path must never be produced from a bare name.
         let bare = strip_exe_suffix("kanade.exe", ".exe");
-        let kata = format!("{bare}-{target}.exe");
-        assert_eq!(kata, format!("kanade-{target}.exe"));
-        assert!(!kata.contains(".exe-"), "must not embed `.exe` mid-path");
+        let suffixed = format!("{bare}-{target}.exe");
+        assert_eq!(suffixed, format!("kanade-{target}.exe"));
+        assert!(
+            !suffixed.contains(".exe-"),
+            "must not embed `.exe` mid-path"
+        );
+        assert_eq!(format!("{bare}.exe"), "kanade.exe");
     }
 
     #[test]
