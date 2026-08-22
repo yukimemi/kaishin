@@ -32,6 +32,32 @@ here so each tool's auto-load behaviour still finds something.
   `chore/release-*`, `kata-apply/auto`, `apm-bump/auto`, and
   Renovate / Dependabot authors) — a missing Claude review on
   those PRs is expected, not a failure.
+- **Any PR that touches the Claude workflow files goes
+  unreviewed.** `claude-code-action` requires the workflow file to
+  already exist on the default branch **with identical content** —
+  otherwise a PR could rewrite the workflow to exfiltrate the
+  token. When the content differs it logs "Skipping action due to
+  workflow validation" and exits 0 without reviewing: a green
+  check with no review attached. This covers two cases, and the
+  second is the one that keeps surprising people:
+  - the PR that first adopts these templates (the workflow does
+    not exist on the default branch yet), and
+  - any later PR that **edits** `claude-review.yml` / `claude.yml`,
+    e.g. hand-pulling an upstream template fix.
+
+  Not fixable from this side — it is the mechanism that makes the
+  token safe to hand to the action at all. Expected: merge on CI +
+  owner approval; reviews resume on the next PR that leaves the
+  workflows alone. The `kata-apply/auto` branch is already excluded
+  by the job-level `if:`, so the daily template-refresh PRs do not
+  add noise here.
+- **A missing credential fails loudly instead.** If the repo has
+  neither `CLAUDE_CODE_OAUTH_TOKEN` nor `ANTHROPIC_API_KEY` set,
+  the guard step fails the job — set one and re-run (subscription
+  path: `claude setup-token` → `gh secret set`; pay-as-you-go:
+  store `ANTHROPIC_API_KEY` and swap the action input to
+  `anthropic_api_key`). Distinguishing the two: **red** means no
+  credential, **green with no review** means workflow validation.
 - **The Claude full review fires once, at PR open** (plus
   `ready_for_review` / `reopened`) — fix pushes do **not** re-trigger
   it (`synchronize` is deliberately off the trigger list; a full
@@ -269,6 +295,40 @@ gh pr merge --auto --squash --delete-branch
 
 Once CI is green the PR auto-merges. `auto-tag.yml` then pushes
 `vX.Y.Z`, which fires `release.yml`.
+
+**In a workspace, the version is in more than one place.** A member
+that is published and depended on by another member is declared
+with both a `path` and a `version` — crates.io needs a
+requirement it can resolve for somebody who is not building from
+the checkout, so a bare `path` will not do:
+
+```toml
+my-core = { path = "crates/my-core", version = "0.4.2" }
+```
+
+That literal does not follow `[workspace.package] version`.
+Nothing in Cargo makes it, and the release above will not either.
+
+**It fails late and quietly.** `version = "0.4.2"` means `^0.4.2`,
+so a stale pin keeps resolving through every *patch* release and
+stops only at the first bump that crosses the minor — where
+`cargo build` refuses with `candidate versions found which didn't
+match`, in the middle of cutting the release. Two repos on these
+templates hit exactly this, one of them three releases after its
+pins were last correct, and the other had already written the
+hazard down in prose and drifted anyway.
+
+So bump the pins in the same commit, keep them in
+`[workspace.dependencies]` rather than in each member, and assert
+it rather than remembering it. A test is the cheapest place —
+`cargo test` already runs in CI, and it needs no toolchain a Rust
+workspace does not have. [pj-rust-workspace's
+README](https://github.com/yukimemi/pj-rust-workspace#the-internal-version-pin-and-the-check-for-it)
+carries one to copy into any member's
+`tests/check_versions.rs`: `internal_pins_match_the_workspace_version`
+fails when a pin and the workspace version disagree, and
+`members_inherit_the_workspace_version` fails when a member writes
+its own version or reaches for a sibling by path.
 
 **Repo settings to set once:** enable
 `delete_branch_on_merge=true` (Settings → General →
