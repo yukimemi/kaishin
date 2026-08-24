@@ -17,6 +17,9 @@ Universal self-update library for Rust CLIs, extracted from rvpm and renri.
 - Silent background auto-update (Claude-Code style) via [`Checker::auto_update`] / [`Checker::spawn_auto_update`]
 - Customizable update banner
 - Interactive/Non-interactive update flow
+- Authenticated GitHub API requests when a token is available (see
+  [Authentication](#authentication)), raising the rate limit from 60/hr to
+  5000/hr
 
 ## Usage
 
@@ -127,6 +130,26 @@ Notes:
   automatically if a process exits or crashes).
 - Use [`Checker::auto_update`] directly (instead of `spawn_auto_update`) if you
   want to await the result and learn which version was installed.
+
+## Authentication
+
+All GitHub API calls (release lookup and asset download) are made
+unauthenticated by default, which shares GitHub's public rate limit of
+**60 requests/hour per source IP** — easy to exhaust behind a corporate
+NAT/proxy or a busy CI runner, surfacing as `GitHub releases API returned
+403 Forbidden`.
+
+`kaishin` automatically authenticates outbound requests when a token is
+available, checked in this order:
+
+1. `GH_TOKEN` env var
+2. `GITHUB_TOKEN` env var
+3. `gh auth token` — best-effort fallback to the GitHub CLI's stored
+   credential; silently skipped if `gh` isn't installed or isn't logged in
+
+An authenticated request raises the limit to **5000 requests/hour**. No
+configuration is required on the consuming crate's side — just make sure one
+of the above is available in the environment where `self-update` runs.
 
 ## License
 
