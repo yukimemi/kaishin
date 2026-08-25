@@ -461,6 +461,109 @@ fn gh_cli_auth_token() -> Option<String> {
     }
 }
 
+/// Turns a failed GitHub releases API response into a message that names the
+/// actual problem.
+///
+/// GitHub answers an exhausted REST quota with a bare `403 Forbidden`, which
+/// is indistinguishable from a permissions error at a glance — the quota
+/// state lives only in the response headers. Left unexplained, the caller
+/// sees "GitHub releases API returned 403 Forbidden" and has to go poll
+/// `/rate_limit` by hand to learn that it is transient and when it clears.
+///
+/// So report which quota was hit, when it frees up, and — when the request
+/// went out unauthenticated — that a token lifts the ceiling from 60/hr
+/// (shared by every client on the source IP) to 5000/hr.
+///
+/// Secondary (abuse-detection) limits are a separate mechanism: GitHub
+/// signals those with `retry-after` and does *not* reliably zero
+/// `x-ratelimit-remaining`, so they are detected first and reported
+/// differently — waiting is the only remedy there, and suggesting a token
+/// would be wrong.
+///
+/// `now_unix` is injected rather than read from the clock so the countdown
+/// is testable.
+fn describe_api_failure(
+    status: reqwest::StatusCode,
+    remaining: Option<&str>,
+    reset: Option<&str>,
+    retry_after: Option<&str>,
+    now_unix: u64,
+    authenticated: bool,
+) -> String {
+    let parse = |v: Option<&str>| v.and_then(|s| s.trim().parse::<u64>().ok());
+
+    // Secondary/abuse limits come with `retry-after` (on either 403 or 429)
+    // and commonly leave `x-ratelimit-remaining` untouched, so this has to be
+    // checked BEFORE the primary-quota branch — otherwise a secondary limit
+    // falls through to the generic message with no explanation at all.
+    let throttled = matches!(
+        status,
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+
+    if let Some(secs) = throttled.then(|| parse(retry_after)).flatten() {
+        let wait = if secs == 0 {
+            "retry now".to_string()
+        } else {
+            format!(
+                "retry after {}",
+                humantime::format_duration(Duration::from_secs(secs))
+            )
+        };
+        return format!(
+            "GitHub secondary rate limit hit ({wait}). This is abuse-detection \
+             throttling rather than the hourly quota, so a token does not raise it \
+             — slow the request rate instead"
+        );
+    }
+
+    // `x-ratelimit-remaining: 0` is what separates a quota 403 from a real
+    // permissions 403. 429 is accepted too: a secondary limit without
+    // `retry-after` still lands here when the quota headers say it is spent.
+    let quota_exhausted = throttled && parse(remaining) == Some(0);
+
+    if quota_exhausted {
+        let mut msg = String::from("GitHub API rate limit exceeded");
+        // Clock skew (or a reset already in the past) must not underflow into
+        // a nonsense countdown.
+        if let Some(secs) = parse(reset).map(|r| r.saturating_sub(now_unix)) {
+            if secs == 0 {
+                msg.push_str(" (the quota should have reset already — retry now)");
+            } else {
+                msg.push_str(&format!(
+                    " (resets in {})",
+                    humantime::format_duration(Duration::from_secs(secs))
+                ));
+            }
+        }
+        if authenticated {
+            msg.push_str(
+                ". The request was authenticated, so this is that token's own 5000/hr quota",
+            );
+        } else {
+            msg.push_str(
+                ". The request was unauthenticated and shares a 60/hr quota with every client \
+                 on this IP address; set GH_TOKEN or GITHUB_TOKEN, or run `gh auth login`, \
+                 to get 5000/hr",
+            );
+        }
+        return msg;
+    }
+
+    // A token was found and GitHub rejected it. Worth calling out precisely:
+    // an expired or revoked credential is strictly worse than sending none,
+    // and the fix (drop it, or re-login) is not obvious from a bare 401.
+    if status == reqwest::StatusCode::UNAUTHORIZED && authenticated {
+        return format!(
+            "GitHub releases API returned {status}: the resolved GitHub token was rejected. \
+             Unset GH_TOKEN / GITHUB_TOKEN, or refresh the GitHub CLI login with \
+             `gh auth login`"
+        );
+    }
+
+    format!("GitHub releases API returned {status}")
+}
+
 /// Fetches the latest release information for the repository specified in `opts` from GitHub.
 pub async fn check_latest_release(opts: &KaishinOptions) -> Result<LatestRelease> {
     let url = format!(
@@ -471,13 +574,35 @@ pub async fn check_latest_release(opts: &KaishinOptions) -> Result<LatestRelease
         .user_agent(format!("{}/{}", opts.bin_name, opts.current_version))
         .timeout(Duration::from_secs(5))
         .build()?;
+    let token = resolve_github_token();
+    let authenticated = token.is_some();
     let mut req = client.get(url);
-    if let Some(token) = resolve_github_token() {
+    if let Some(token) = token {
         req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
     }
     let res = req.send().await?;
     if !res.status().is_success() {
-        return Err(anyhow!("GitHub releases API returned {}", res.status()));
+        let status = res.status();
+        let header = |name: &str| {
+            res.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let remaining = header("x-ratelimit-remaining");
+        let reset = header("x-ratelimit-reset");
+        let retry_after = header("retry-after");
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        return Err(anyhow!(describe_api_failure(
+            status,
+            remaining.as_deref(),
+            reset.as_deref(),
+            retry_after.as_deref(),
+            now_unix,
+            authenticated,
+        )));
     }
     let release: LatestRelease = res.json().await?;
     Ok(release)
@@ -1126,6 +1251,122 @@ mod tests {
         // hard-fails the request instead of degrading gracefully.
         let token = resolve_github_token_with(|| Some("gh-token\n".to_string()), || None, || None);
         assert_eq!(token.as_deref(), Some("gh-token"));
+    }
+
+    #[test]
+    fn test_describe_api_failure_rate_limited_unauthenticated() {
+        // The real-world case: `self-update` on a shared IP with the 60/hr
+        // public quota spent. A bare "403 Forbidden" sent users to poll
+        // /rate_limit by hand, so the message has to name the cause, the
+        // wait, and the fix.
+        let msg = describe_api_failure(
+            reqwest::StatusCode::FORBIDDEN,
+            Some("0"),
+            Some("1787591834"),
+            None,
+            1_787_591_734,
+            false,
+        );
+        assert!(msg.contains("rate limit exceeded"), "{msg}");
+        assert!(msg.contains("resets in 1m 40s"), "{msg}");
+        assert!(msg.contains("GH_TOKEN"), "{msg}");
+        assert!(msg.contains("60/hr"), "{msg}");
+    }
+
+    #[test]
+    fn test_describe_api_failure_rate_limited_authenticated() {
+        // Already authenticated: pointing at GH_TOKEN would be useless
+        // advice, so say whose quota was actually spent.
+        let msg = describe_api_failure(
+            reqwest::StatusCode::FORBIDDEN,
+            Some("0"),
+            Some("1787591834"),
+            None,
+            1_787_591_834,
+            true,
+        );
+        assert!(msg.contains("rate limit exceeded"), "{msg}");
+        assert!(msg.contains("5000/hr"), "{msg}");
+        assert!(!msg.contains("gh auth login"), "{msg}");
+        // Reset already due — must not render a bogus countdown.
+        assert!(msg.contains("retry now"), "{msg}");
+    }
+
+    #[test]
+    fn test_describe_api_failure_secondary_limit_uses_retry_after() {
+        // Secondary (abuse-detection) limiting is signalled with
+        // `retry-after` and commonly leaves `x-ratelimit-remaining` alone.
+        // Keying only on `remaining == 0` would drop these into the generic
+        // message with no explanation, so `retry-after` is checked first.
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let msg = describe_api_failure(status, Some("42"), None, Some("60"), 0, true);
+            assert!(msg.contains("secondary rate limit"), "{msg}");
+            assert!(msg.contains("retry after 1m"), "{msg}");
+            // A token does not lift a secondary limit — saying so would send
+            // the user after a fix that cannot work.
+            assert!(!msg.contains("GH_TOKEN"), "{msg}");
+            assert!(!msg.contains("5000/hr"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_describe_api_failure_quota_clock_skew_saturates() {
+        // Reset timestamp behind a skewed clock: the subtraction must
+        // saturate, never underflow into ~584 billion years of waiting.
+        let msg = describe_api_failure(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Some("0"),
+            Some("100"),
+            None,
+            5_000,
+            false,
+        );
+        assert!(msg.contains("rate limit exceeded"), "{msg}");
+        assert!(msg.contains("retry now"), "{msg}");
+    }
+
+    #[test]
+    fn test_describe_api_failure_permission_403_is_not_reported_as_quota() {
+        // A 403 with quota remaining is a genuine permissions problem.
+        // Blaming the rate limit here would send the user chasing a wait
+        // that never ends.
+        let msg = describe_api_failure(
+            reqwest::StatusCode::FORBIDDEN,
+            Some("59"),
+            Some("1787591834"),
+            None,
+            1_787_591_734,
+            false,
+        );
+        assert_eq!(msg, "GitHub releases API returned 403 Forbidden");
+
+        // Missing headers (proxies strip them) must also fall through.
+        let msg = describe_api_failure(reqwest::StatusCode::FORBIDDEN, None, None, None, 0, false);
+        assert_eq!(msg, "GitHub releases API returned 403 Forbidden");
+    }
+
+    #[test]
+    fn test_describe_api_failure_rejected_token() {
+        // An expired or revoked credential is strictly worse than sending
+        // none at all, and a bare 401 doesn't hint at that.
+        let msg =
+            describe_api_failure(reqwest::StatusCode::UNAUTHORIZED, None, None, None, 0, true);
+        assert!(msg.contains("token was rejected"), "{msg}");
+        assert!(msg.contains("gh auth login"), "{msg}");
+
+        // Unauthenticated 401 is not a token problem — stay generic.
+        let msg = describe_api_failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            None,
+            None,
+            None,
+            0,
+            false,
+        );
+        assert_eq!(msg, "GitHub releases API returned 401 Unauthorized");
     }
 
     #[test]
