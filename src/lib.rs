@@ -401,6 +401,66 @@ pub fn is_update_available(current: &str, latest_tag: &str) -> Result<bool> {
     Ok(lat > cur)
 }
 
+/// Resolves a GitHub API token to authenticate outbound requests, checked in
+/// this order:
+///
+/// 1. `GH_TOKEN` — the GitHub CLI's own top-priority env var.
+/// 2. `GITHUB_TOKEN` — the convention used by Actions and most GitHub tooling.
+/// 3. `gh auth token` — best-effort fallback to the GitHub CLI's stored
+///    credential when neither env var is set. Silently ignored if `gh` is
+///    missing, not on `PATH`, or not logged in; callers proceed
+///    unauthenticated in that case.
+///
+/// An authenticated request raises the GitHub REST API rate limit from
+/// 60/hr (per source IP, shared by everyone behind the same NAT/proxy) to
+/// 5000/hr — this is what actually unblocks `self-update` for users on a
+/// busy shared IP who hit `403 rate limit exceeded` while unauthenticated.
+pub fn resolve_github_token() -> Option<String> {
+    resolve_github_token_with(
+        || std::env::var("GH_TOKEN").ok(),
+        || std::env::var("GITHUB_TOKEN").ok(),
+        gh_cli_auth_token,
+    )
+}
+
+fn resolve_github_token_with(
+    gh_token_env: impl FnOnce() -> Option<String>,
+    github_token_env: impl FnOnce() -> Option<String>,
+    gh_cli: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    fn non_empty(s: Option<String>) -> Option<String> {
+        let trimmed = s?.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+    non_empty(gh_token_env())
+        .or_else(|| non_empty(github_token_env()))
+        .or_else(|| non_empty(gh_cli()))
+}
+
+/// Best-effort: ask the GitHub CLI for its stored token. Returns `None` on
+/// any failure (missing binary, not logged in, non-zero exit) — this is a
+/// convenience fallback, never a hard dependency on `gh` being installed.
+fn gh_cli_auth_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
 /// Fetches the latest release information for the repository specified in `opts` from GitHub.
 pub async fn check_latest_release(opts: &KaishinOptions) -> Result<LatestRelease> {
     let url = format!(
@@ -411,7 +471,11 @@ pub async fn check_latest_release(opts: &KaishinOptions) -> Result<LatestRelease
         .user_agent(format!("{}/{}", opts.bin_name, opts.current_version))
         .timeout(Duration::from_secs(5))
         .build()?;
-    let res = client.get(url).send().await?;
+    let mut req = client.get(url);
+    if let Some(token) = resolve_github_token() {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let res = req.send().await?;
     if !res.status().is_success() {
         return Err(anyhow!("GitHub releases API returned {}", res.status()));
     }
@@ -980,6 +1044,9 @@ fn try_github_release_once(
     if let Some(t) = target_override {
         builder.target(t);
     }
+    if let Some(token) = resolve_github_token() {
+        builder.auth_token(&token);
+    }
     let status = builder
         .build()
         .context("build")?
@@ -1017,6 +1084,48 @@ mod tests {
 
         let p = PathBuf::from("/opt/kaishin-bin/kaishin");
         assert_eq!(detect_install_method(&p), InstallMethod::DirectBinary);
+    }
+
+    #[test]
+    fn test_resolve_github_token_with_precedence() {
+        // GH_TOKEN wins over GITHUB_TOKEN and the gh CLI fallback.
+        let token = resolve_github_token_with(
+            || Some("gh-token".to_string()),
+            || Some("github-token".to_string()),
+            || Some("cli-token".to_string()),
+        );
+        assert_eq!(token.as_deref(), Some("gh-token"));
+
+        // GITHUB_TOKEN is used when GH_TOKEN is unset.
+        let token = resolve_github_token_with(
+            || None,
+            || Some("github-token".to_string()),
+            || Some("cli-token".to_string()),
+        );
+        assert_eq!(token.as_deref(), Some("github-token"));
+
+        // Falls back to `gh auth token` when neither env var is set.
+        let token = resolve_github_token_with(|| None, || None, || Some("cli-token".to_string()));
+        assert_eq!(token.as_deref(), Some("cli-token"));
+
+        // Empty env vars are treated as unset, not as an empty token.
+        let token = resolve_github_token_with(
+            || Some(String::new()),
+            || Some("   ".to_string()),
+            || Some("cli-token".to_string()),
+        );
+        assert_eq!(token.as_deref(), Some("cli-token"));
+
+        // No source available at all.
+        let token = resolve_github_token_with(|| None, || None, || None);
+        assert_eq!(token, None);
+
+        // A trailing newline (e.g. `export GH_TOKEN="$(cat token_file)"` with
+        // a file ending in a newline) must be trimmed, not embedded verbatim —
+        // an untrimmed value produces an invalid `Authorization` header and
+        // hard-fails the request instead of degrading gracefully.
+        let token = resolve_github_token_with(|| Some("gh-token\n".to_string()), || None, || None);
+        assert_eq!(token.as_deref(), Some("gh-token"));
     }
 
     #[test]
