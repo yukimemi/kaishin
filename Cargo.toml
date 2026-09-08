@@ -37,7 +37,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "json",
     "rustls",
 ] }
-dirs = "6.0"
+dirs = "7.0.0"
 tempfile = "3"
 console = "0.16.4"
 # Cross-process advisory file locking for the background auto-update guard.
