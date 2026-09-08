@@ -51,9 +51,15 @@ e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/kaishin-target cargo test --locked --a
 # `Makefile.toml`'s `[tasks.check]` advertises itself as "same as CI" and its
 # `dependencies` were checked against every ci.yml job:
 #   - editorconfig-check <-> the `editorconfig` job. Both Makefile.toml and
-#     ci.yml carry this check (the Makefile task skips itself gracefully when
-#     `editorconfig-checker` isn't on PATH, but ci.yml always installs and
-#     runs it, so the pair together is the correct state for this repo).
+#     ci.yml carry this check, which is the right state for a human running
+#     `cargo make check` by hand: CI is still the backstop, so the Makefile
+#     task's own `editorconfig-check` skipping gracefully (exit 0) when
+#     `editorconfig-checker` isn't on PATH costs nothing there. `verify.gate`
+#     has no such backstop — it is what stands in for "will CI pass" before
+#     magi merges, so the same silent skip here would let an editorconfig
+#     violation through gate clean and fail CI anyway. `editorconfig-checker`
+#     is therefore invoked directly below, in addition to `cargo make check`,
+#     so a machine without the binary fails the gate instead of passing it.
 #   - fmt-check           <-> the `fmt` job (`cargo fmt --all -- --check`).
 #   - clippy              <-> the `clippy` job (`cargo clippy --all-targets --
 #                              -D warnings`; the Makefile task additionally
@@ -70,8 +76,13 @@ e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/kaishin-target cargo test --locked --a
 # Makefile.toml's "same as CI" task either, it needs a `CODECOV_TOKEN` this
 # checkout doesn't have, and `fail_ci_if_error: false` in ci.yml already means
 # a bad upload doesn't fail that job — coverage is observability, not a
-# correctness gate. So `cargo make check` alone is the right gate command.
-gate = ["CARGO_TARGET_DIR={{ vars.cache }}/kaishin-target cargo make check"]
+# correctness gate. So `cargo make check` plus the explicit editorconfig
+# invocation below are the right gate commands; every entry must exit 0 for
+# the gate to pass.
+gate = [
+  "CARGO_TARGET_DIR={{ vars.cache }}/kaishin-target cargo make check",
+  "editorconfig-checker",
+]
 
 [merge]
 mode = "none"
