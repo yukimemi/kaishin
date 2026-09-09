@@ -441,12 +441,43 @@ fn resolve_github_token_with(
         .or_else(|| non_empty(gh_cli()))
 }
 
+/// Windows process-creation flag that gives a child process a console
+/// without letting Windows draw a window for it. Not to be confused with
+/// `DETACHED_PROCESS` (`0x8`, no console at all — a *grandchild* console
+/// app spawned from there gets its own window, which is exactly the bug
+/// this flag avoids) or `CREATE_NEW_CONSOLE` (`0x10`, forces a new visible
+/// window unconditionally).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Suppresses the console window Windows would otherwise draw for a child
+/// console process (e.g. `gh.exe`, `cargo.exe`) when the current process
+/// itself has no console — as happens when a self-update relauncher is
+/// started with `DETACHED_PROCESS`. No-op on non-Windows.
+trait NoConsoleWindowExt {
+    fn no_console_window(&mut self) -> &mut Self;
+}
+
+impl NoConsoleWindowExt for std::process::Command {
+    #[cfg(windows)]
+    fn no_console_window(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt as _;
+        self.creation_flags(CREATE_NO_WINDOW)
+    }
+
+    #[cfg(not(windows))]
+    fn no_console_window(&mut self) -> &mut Self {
+        self
+    }
+}
+
 /// Best-effort: ask the GitHub CLI for its stored token. Returns `None` on
 /// any failure (missing binary, not logged in, non-zero exit) — this is a
 /// convenience fallback, never a hard dependency on `gh` being installed.
 fn gh_cli_auth_token() -> Option<String> {
     let output = std::process::Command::new("gh")
         .args(["auth", "token"])
+        .no_console_window()
         .output()
         .ok()?;
     if !output.status.success() {
@@ -963,6 +994,7 @@ fn update_via_cargo_install(opts: &KaishinOptions, latest_clean: &str) -> Result
         .arg("--force")
         .arg("--root")
         .arg(&tmp_root)
+        .no_console_window()
         .status()?;
     if !status.success() {
         anyhow::bail!("cargo install failed");
@@ -1209,6 +1241,26 @@ mod tests {
 
         let p = PathBuf::from("/opt/kaishin-bin/kaishin");
         assert_eq!(detect_install_method(&p), InstallMethod::DirectBinary);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_create_no_window_flag_value_and_distinctness() {
+        // The literal Windows API value for CREATE_NO_WINDOW, so a typo here
+        // (or in the constant above) fails the test instead of quietly
+        // reintroducing the console-flash bug.
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+
+        const DETACHED_PROCESS: u32 = 0x8;
+        const CREATE_NEW_CONSOLE: u32 = 0x10;
+        assert_ne!(
+            CREATE_NO_WINDOW, DETACHED_PROCESS,
+            "must not collapse to DETACHED_PROCESS, which leaves grandchild console apps unhidden"
+        );
+        assert_ne!(
+            CREATE_NO_WINDOW, CREATE_NEW_CONSOLE,
+            "must not collapse to CREATE_NEW_CONSOLE, which forces a visible window"
+        );
     }
 
     #[test]
