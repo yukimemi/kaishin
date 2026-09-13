@@ -471,6 +471,113 @@ impl NoConsoleWindowExt for std::process::Command {
     }
 }
 
+/// Replaces the running executable with `new_executable`.
+///
+/// On non-Windows this defers to `self_update::self_replace::self_replace`,
+/// which unlinks the old file directly — no subprocess involved, so there is
+/// no console-window concern there.
+///
+/// On Windows, `self_update::self_replace::self_replace` (and, transitively,
+/// `self_update`'s own `Update::update()`) spawns the copy-of-itself helper
+/// that performs the delayed delete of the old binary via a plain
+/// `std::process::Command` with no creation flags. That helper is a copy of
+/// whatever console-subsystem binary links this crate in, so when the parent
+/// is itself consoleless (as it is mid self-update-and-restart), Windows
+/// allocates a fresh console and flashes a window for it — the empty
+/// `__selfdelete__.exe` window this function exists to avoid. Neither crate
+/// exposes a hook to pass creation flags into that spawn, so this
+/// reimplements the same rename-aside / copy-into-place sequence and does
+/// its own best-effort cleanup of the old binary via [`NoConsoleWindowExt`].
+#[cfg(windows)]
+fn self_replace_exe(new_executable: &Path) -> Result<()> {
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .context("failed to resolve current_exe()")?;
+    let old_exe = windows_replace_files(&exe, new_executable)?;
+    windows_spawn_delete_helper(&old_exe);
+    Ok(())
+}
+
+/// Renames `exe` aside and copies `new_executable` into its place, returning
+/// the path `exe` was relocated to (for the caller to schedule its cleanup).
+///
+/// Split out from [`self_replace_exe`] so the file-swap logic is unit
+/// testable against an arbitrary path instead of the test binary's own
+/// `current_exe()` — replacing *that* out from under a running test process
+/// would be self-defeating.
+#[cfg(windows)]
+fn windows_replace_files(exe: &Path, new_executable: &Path) -> Result<PathBuf> {
+    let dir = exe
+        .parent()
+        .context("current executable has no parent directory")?;
+    let old_exe = windows_temp_sibling(dir, exe, "relocated");
+    std::fs::rename(exe, &old_exe)
+        .with_context(|| format!("failed to move {} aside", exe.display()))?;
+
+    let staged = windows_temp_sibling(dir, exe, "incoming");
+    let install =
+        std::fs::copy(new_executable, &staged).and_then(|_| std::fs::rename(&staged, exe));
+    if let Err(e) = install {
+        // Best-effort rollback: put the original binary back rather than
+        // leaving the install path empty.
+        let _ = std::fs::rename(&old_exe, exe);
+        let _ = std::fs::remove_file(&staged);
+        return Err(e).context("failed to install the new executable");
+    }
+    Ok(old_exe)
+}
+
+#[cfg(not(windows))]
+fn self_replace_exe(new_executable: &Path) -> Result<()> {
+    self_update::self_replace::self_replace(new_executable).map_err(Into::into)
+}
+
+/// Builds a same-directory temp path derived from `exe`'s name, tagged with
+/// `label` and a process-id + timestamp suffix that's unique enough for a
+/// single self-update run (no concurrent self-updates of the same binary are
+/// expected).
+#[cfg(windows)]
+fn windows_temp_sibling(dir: &Path, exe: &Path, label: &str) -> PathBuf {
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("kaishin");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(
+        ".{stem}.{}.{nanos}.__{label}__.exe",
+        std::process::id()
+    ))
+}
+
+/// Fire-and-forget: retries deleting `path` for a while, on the assumption
+/// that it's the just-renamed-aside old executable and is still open (and
+/// thus undeletable) until this process exits, which happens shortly after
+/// this function returns as part of the update-and-restart flow. Spawned
+/// with [`NoConsoleWindowExt::no_console_window`] since the deleter is
+/// `cmd.exe`, a console-subsystem binary.
+#[cfg(windows)]
+fn windows_spawn_delete_helper(path: &Path) {
+    let _ = std::process::Command::new("cmd")
+        .arg("/c")
+        .arg(windows_delete_retry_script(path))
+        .no_console_window()
+        .spawn();
+}
+
+/// Pure builder for the retry-delete one-liner, split out from
+/// [`windows_spawn_delete_helper`] so the command shape is unit-testable
+/// without actually spawning a process.
+#[cfg(windows)]
+fn windows_delete_retry_script(path: &Path) -> String {
+    let p = path.display();
+    format!(
+        "for /L %i in (1,1,50) do (del /f /q \"{p}\" >nul 2>&1 & if not exist \"{p}\" exit /b 0 & ping -n 1 127.0.0.1 >nul)"
+    )
+}
+
 /// Best-effort: ask the GitHub CLI for its stored token. Returns `None` on
 /// any failure (missing binary, not logged in, non-zero exit) — this is a
 /// convenience fallback, never a hard dependency on `gh` being installed.
@@ -1005,7 +1112,7 @@ fn update_via_cargo_install(opts: &KaishinOptions, latest_clean: &str) -> Result
         opts.bin_name.clone()
     };
     let new_exe = tmp_root.join("bin").join(bin_exe_name);
-    self_update::self_replace::self_replace(&new_exe)?;
+    self_replace_exe(&new_exe)?;
     println!("\u{2713} {} v{} installed.", opts.bin_name, latest_clean);
     Ok(())
 }
@@ -1204,11 +1311,33 @@ fn try_github_release_once(
     if let Some(token) = resolve_github_token() {
         builder.auth_token(&token);
     }
+    // On Windows, point `self_update` at a staging path instead of the
+    // running executable. That makes it take its `Move`-to-`bin_install_path`
+    // branch (a plain rename) rather than its own `self_replace` call, which
+    // is where the stray console window comes from — see `self_replace_exe`.
+    // The actual replace of the running binary happens below, through our
+    // own no-console-window-safe implementation.
+    #[cfg(windows)]
+    let staged_new_exe = {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("{}-fetch-", opts.bin_name))
+            .tempdir()
+            .context("failed to create staging directory for downloaded binary")?;
+        let path = dir
+            .path()
+            .join(format!("{}{}", opts.bin_name, std::env::consts::EXE_SUFFIX));
+        builder.bin_install_path(&path);
+        (dir, path)
+    };
     let status = builder
         .build()
         .context("build")?
         .update()
         .context("update")?;
+    #[cfg(windows)]
+    if matches!(status, self_update::Status::Updated(_)) {
+        self_replace_exe(&staged_new_exe.1).context("failed to install downloaded binary")?;
+    }
     // Stay silent on the background auto-update path (`show_progress == false`);
     // the interactive flows keep their confirmation output.
     if show_progress {
@@ -1261,6 +1390,71 @@ mod tests {
             CREATE_NO_WINDOW, CREATE_NEW_CONSOLE,
             "must not collapse to CREATE_NEW_CONSOLE, which forces a visible window"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_replace_files_swaps_contents_and_relocates_old() {
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("app.exe");
+        let new_exe = dir.path().join("app-new.exe");
+        std::fs::write(&exe, b"old").unwrap();
+        std::fs::write(&new_exe, b"new").unwrap();
+
+        let old_exe = windows_replace_files(&exe, &new_exe).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert_eq!(std::fs::read(&old_exe).unwrap(), b"old");
+        assert_ne!(old_exe, exe);
+        assert_eq!(old_exe.parent(), Some(dir.path()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_replace_files_rolls_back_on_copy_failure() {
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("app.exe");
+        std::fs::write(&exe, b"old").unwrap();
+        let missing_new_exe = dir.path().join("does-not-exist.exe");
+
+        let err = windows_replace_files(&exe, &missing_new_exe).unwrap_err();
+        assert!(err.to_string().contains("failed to install"));
+        // Rolled back: the original binary must still be in place, not lost.
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_temp_sibling_is_hidden_and_distinct_per_label() {
+        let dir = PathBuf::from(r"C:\some\dir");
+        let exe = dir.join("app.exe");
+        let relocated = windows_temp_sibling(&dir, &exe, "relocated");
+        let incoming = windows_temp_sibling(&dir, &exe, "incoming");
+
+        assert_eq!(relocated.parent(), Some(dir.as_path()));
+        assert_ne!(relocated, incoming);
+        assert!(
+            relocated
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+        );
+        assert!(relocated.to_string_lossy().contains("__relocated__"));
+        assert!(incoming.to_string_lossy().contains("__incoming__"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_delete_retry_script_targets_path_without_opening_a_window() {
+        let path =
+            PathBuf::from(r"C:\Users\yukimemi\AppData\Local\Temp\.app.123.456.__relocated__.exe");
+        let script = windows_delete_retry_script(&path);
+        assert!(script.contains("del /f /q"));
+        assert!(script.contains(&path.display().to_string()));
+        // `start` (with or without `/min`) would ask cmd.exe to spawn a new
+        // process itself, defeating the point of spawning cmd.exe with
+        // `no_console_window` in the first place.
+        assert!(!script.to_lowercase().contains("start "));
     }
 
     #[test]
